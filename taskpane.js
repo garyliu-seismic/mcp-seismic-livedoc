@@ -12,6 +12,7 @@ let editId        = null;
 
 // Tracks the name of the currently selected table shape in the slide (updated on selection change)
 let selectedTableName = null;
+let currentSlideId    = null; // Tracks current slide; used to detect slide switches
 
 const XML_NS    = 'http://schemas.livedoc.seismic.com/poc-variables/v2';
 const XML_NS_V1 = 'http://schemas.livedoc.seismic.com/poc-variables/v1';
@@ -793,50 +794,81 @@ function initSelectionHandler() {
 
 async function onSlideSelectionChanged() {
   try {
+    var newSlideId = null;
+    var foundTable = null;
+    var dynConfig  = null;
+
     await PowerPoint.run(async function (context) {
-      var shapes;
+      // Detect current slide ID so we can tell when the user switches slides
       try {
-        shapes = context.presentation.getSelectedShapes();
+        var selSlides = context.presentation.getSelectedSlides();
+        selSlides.load('items/id');
+        await context.sync();
+        newSlideId = selSlides.items.length ? selSlides.items[0].id : null;
+      } catch (_) {}
+
+      // Detect selected table shape
+      try {
+        var shapes = context.presentation.getSelectedShapes();
         shapes.load('items/name,items/type');
         await context.sync();
-      } catch (_) {
-        // getSelectedShapes not available (API < 1.5) or nothing selected
-        selectedTableName = null;
-        return;
-      }
+        foundTable = shapes.items.find(function (s) {
+          return s.type === 'Table' ||
+                 (typeof PowerPoint !== 'undefined' &&
+                  typeof PowerPoint.ShapeType !== 'undefined' &&
+                  s.type === PowerPoint.ShapeType.table);
+        }) || null;
+      } catch (_) {}
 
-      var table = shapes.items.find(function (s) {
-        return s.type === 'Table' ||
-               (typeof PowerPoint !== 'undefined' &&
-                typeof PowerPoint.ShapeType !== 'undefined' &&
-                s.type === PowerPoint.ShapeType.table);
-      });
-
-      selectedTableName = table ? table.name : null;
-
-      // If the Dynamic Table Settings drawer is already open, sync all fields
-      if (editMode === 'dynamic' && selectedTableName) {
-        // Sync the Slide Table dropdown
-        var sel = document.getElementById('df-dyn-shape');
-        if (sel) {
-          for (var i = 0; i < sel.options.length; i++) {
-            if (sel.options[i].value === selectedTableName) { sel.selectedIndex = i; break; }
-          }
-        }
-
-        // Load the existing LIVEDOC_DYN_TABLE tag so Variable/From/To reflect this shape
+      // If drawer open + table found: load its existing LIVEDOC_DYN_TABLE config tag
+      if (editMode === 'dynamic' && foundTable) {
         try {
-          table.tags.load('items/key,items/value');
+          foundTable.tags.load('items/key,items/value');
           await context.sync();
-          var dynTag = table.tags.items.find(function (t) { return t.key === 'LIVEDOC_DYN_TABLE'; });
-          syncDynamicDrawerFromConfig(dynTag ? JSON.parse(dynTag.value) : null);
-        } catch (_) {
-          // Tag load failed — leave Variable/Rows as-is
-        }
+          var dynTag = foundTable.tags.items.find(function (t) { return t.key === 'LIVEDOC_DYN_TABLE'; });
+          dynConfig = dynTag ? JSON.parse(dynTag.value) : null;
+        } catch (_) {}
       }
     });
+
+    var slideChanged  = (newSlideId !== null && newSlideId !== currentSlideId);
+    if (newSlideId !== null) currentSlideId = newSlideId;
+    selectedTableName = foundTable ? foundTable.name : null;
+
+    if (editMode === 'dynamic') {
+      if (slideChanged) {
+        // Slide switched — rebuild the full table list and form for the new slide
+        await refreshDynamicDrawer();
+      } else if (selectedTableName) {
+        // Same slide, different table selected — sync dropdown + config fields
+        syncDynamicDrawerDropdown(selectedTableName);
+        syncDynamicDrawerFromConfig(dynConfig);
+      }
+    }
   } catch (_) {
     selectedTableName = null;
+  }
+}
+
+// Reload the Dynamic drawer form for the current slide (called when the slide changes).
+async function refreshDynamicDrawer() {
+  var form = document.getElementById('drawerForm');
+  if (!form) return;
+  form.innerHTML = '<p class="form-hint" style="padding:8px 0">Loading table shapes from current slide…</p>';
+  try {
+    var shapes = await loadCurrentSlideTableShapes();
+    buildDynamicDrawerForm(shapes);
+  } catch (e) {
+    form.innerHTML = '<p class="form-hint" style="color:#c00">Could not load slide shapes: ' + h(e.message) + '</p>';
+  }
+}
+
+// Sync just the Slide Table dropdown to a given shape name.
+function syncDynamicDrawerDropdown(tableName) {
+  var sel = document.getElementById('df-dyn-shape');
+  if (!sel || !tableName) return;
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === tableName) { sel.selectedIndex = i; break; }
   }
 }
 
@@ -893,9 +925,10 @@ async function loadCurrentSlideTableShapes() {
     var slide;
     try {
       var sel = context.presentation.getSelectedSlides();
-      sel.load('items');
+      sel.load('items/id');
       await context.sync();
       slide = sel.items[0];
+      currentSlideId = slide ? slide.id : null;
     } catch (_) {
       slide = context.presentation.slides.getItemAt(0);
     }

@@ -1,23 +1,36 @@
 'use strict';
 
-// ─── State ────────────────────────────────────────────────────────────────────
-/** @type {Array<{name:string, type:string, defaultValue:string, group:string}>} */
+// ── State ──────────────────────────────────────────────────────────────────────
+/** @type {Array<{id:string, kind:'scalar'|'table'|'computed'|'system', name:string, group:string, [key:string]:any}>} */
 let variables = [];
 
-/** @type {Array<{name:string, group:string, columns:string[], rows:string[][]}>} */
-let tableVariables = [];
+const expandedIds = new Set(); // IDs of table/system rows currently expanded
+let searchQuery   = '';
+let editMode      = 'add';    // 'add' | 'edit'
+let editKind      = 'scalar';
+let editId        = null;
 
-const XML_NS = 'http://schemas.livedoc.seismic.com/poc-variables/v1';
+const XML_NS    = 'http://schemas.livedoc.seismic.com/poc-variables/v2';
+const XML_NS_V1 = 'http://schemas.livedoc.seismic.com/poc-variables/v1';
 
-// ─── Type badge labels ────────────────────────────────────────────────────────
 const TYPE_LABELS = { STRING: 'ABC', NUMBER: '123', DATE: 'DT', BOOLEAN: 'T/F' };
 
-// ─── Office.js init ───────────────────────────────────────────────────────────
+// Predefined system variable blueprints
+const SYSTEM_PRESETS = {
+  TOCEntries: {
+    columns:     ['EntryName', 'EntryLevel', 'PageNumber', 'Index'],
+    columnTypes: ['STRING', 'NUMBER', 'NUMBER', 'NUMBER'],
+    description: 'Table of contents entries'
+  }
+};
+
+// ── Office init ────────────────────────────────────────────────────────────────
 Office.onReady((info) => {
   if (info.host === Office.HostType.PowerPoint) {
     document.getElementById('loading').style.display = 'none';
     document.getElementById('app').style.display     = 'flex';
-    setupTabs();
+    initSearch();
+    initAddMenu();
     loadFromCustomXml();
   } else {
     document.getElementById('loading').innerHTML =
@@ -25,21 +38,37 @@ Office.onReady((info) => {
   }
 });
 
-// ─── Tab wiring ───────────────────────────────────────────────────────────────
-function setupTabs() {
-  document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-      btn.classList.add('active');
-      document.getElementById(btn.dataset.tab).classList.add('active');
-    });
+// ── Search ─────────────────────────────────────────────────────────────────────
+function initSearch() {
+  document.getElementById('searchInput').addEventListener('input', function () {
+    searchQuery = this.value.trim().toLowerCase();
+    renderTree();
   });
 }
 
-// ─── Custom XML — Load ────────────────────────────────────────────────────────
-// Must use PowerPoint.run + ctx.presentation.customXmlParts (PowerPointApi 1.7).
-// Office.context.document.customXmlParts is Common API and is undefined in PPT.
+// ── Add-menu dropdown ──────────────────────────────────────────────────────────
+function initAddMenu() {
+  const btn  = document.getElementById('addBtn');
+  const menu = document.getElementById('addMenu');
+  btn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    menu.classList.toggle('hidden');
+  });
+  document.addEventListener('click', function () {
+    menu.classList.add('hidden');
+  });
+}
+
+function openAddDrawer(kind) {
+  document.getElementById('addMenu').classList.add('hidden');
+  editMode = 'add';
+  editKind = kind;
+  editId   = null;
+  buildDrawerForm(kind, null);
+  openDrawer('Add ' + kindLabel(kind));
+}
+
+// ── Custom XML — Load ──────────────────────────────────────────────────────────
 async function loadFromCustomXml() {
   showStatus('Loading from document…', 'info');
   try {
@@ -48,51 +77,53 @@ async function loadFromCustomXml() {
       parts.load('items');
       await ctx.sync();
 
-      console.log('[POC] Total customXmlParts:', parts.items.length);
-      if (parts.items.length === 0) {
+      if (!parts.items.length) {
+        renderTree();
         showStatus('No saved variables in this document yet.', 'info');
-        renderAll();
         return;
       }
 
-      // getXml() returns a ClientResult<string> — must call before sync
       const xmlResults = parts.items.map(p => p.getXml());
       await ctx.sync();
-
       const xmlStrings = xmlResults.map(r => r.value || '');
-      console.log('[POC] XML values:', xmlStrings.map(s => s.slice(0, 120)));
 
-      const matchXml = xmlStrings.find(s => s.includes(XML_NS));
+      let matchXml = xmlStrings.find(s => s.includes(XML_NS));
+      let isV1     = false;
       if (!matchXml) {
+        matchXml = xmlStrings.find(s => s.includes(XML_NS_V1));
+        isV1     = !!matchXml;
+      }
+
+      if (!matchXml) {
+        renderTree();
         showStatus('No saved variables in this document yet.', 'info');
-        renderAll();
         return;
       }
 
       try {
-        parseXml(matchXml);
-        showStatus(`Loaded ${variables.length} variable(s) and ${tableVariables.length} table variable(s).`, 'success');
+        if (isV1) { parseXmlV1(matchXml); }
+        else       { parseXmlV2(matchXml); }
+        showStatus('Loaded ' + variables.length + ' variable(s).', 'success');
       } catch (e) {
-        console.error('[POC] Parse error:', e.message, '\nXML:', matchXml);
-        showStatus('Could not parse saved data: ' + e.message, 'error');
+        showStatus('Parse error: ' + e.message, 'error');
       }
-      renderAll();
+      renderTree();
     });
   } catch (e) {
     showStatus('Load error: ' + e.message, 'error');
-    renderAll();
+    renderTree();
   }
 }
 
 function refreshFromDoc() {
   variables = [];
-  tableVariables = [];
+  expandedIds.clear();
   loadFromCustomXml();
 }
 
-// ─── Custom XML — Save ────────────────────────────────────────────────────────
-async function saveToCustomXml(successMsg) {
-  const xml = buildXml();
+// ── Custom XML — Save ──────────────────────────────────────────────────────────
+async function saveToCustomXml(msg) {
+  const xml = buildXmlV2();
   try {
     await PowerPoint.run(async (ctx) => {
       const parts = ctx.presentation.customXmlParts;
@@ -102,350 +133,588 @@ async function saveToCustomXml(successMsg) {
       const xmlResults = parts.items.map(p => p.getXml());
       await ctx.sync();
 
-      const matchIdx = xmlResults.findIndex(r => (r.value || '').includes(XML_NS));
-      if (matchIdx >= 0) {
-        parts.items[matchIdx].setXml(xml);
-      } else {
-        parts.add(xml);
+      // Collect indices of old v1/v2 parts to remove
+      const toDelete = [];
+      xmlResults.forEach(function (r, i) {
+        const val = r.value || '';
+        if (val.includes(XML_NS) || val.includes(XML_NS_V1)) toDelete.push(i);
+      });
+      // Delete in reverse order so indices stay valid
+      for (let i = toDelete.length - 1; i >= 0; i--) {
+        parts.items[toDelete[i]].delete();
       }
+      parts.add(xml);
       await ctx.sync();
-      showStatus(successMsg || 'Saved.', 'success');
+      showStatus(msg || 'Saved.', 'success');
     });
   } catch (e) {
     showStatus('Save failed: ' + e.message, 'error');
   }
 }
 
-// ─── XML serialization ────────────────────────────────────────────────────────
-function buildXml() {
-  const varEls = variables.map(v =>
-    `<variable name="${x(v.name)}" type="${x(v.type||'STRING')}" defaultValue="${x(v.defaultValue)}" group="${x(v.group||'')}"/>`
-  ).join('\n    ');
+// ── XML v2 — Build ─────────────────────────────────────────────────────────────
+function buildXmlV2() {
+  const els = variables.map(function (v) {
+    const base = 'id="' + x(v.id) + '" kind="' + x(v.kind) + '" name="' + x(v.name) + '" group="' + x(v.group || '') + '"';
+    if (v.kind === 'scalar') {
+      return '<variable ' + base + ' type="' + x(v.type || 'STRING') + '" defaultValue="' + x(v.defaultValue || '') + '"/>';
+    }
+    if (v.kind === 'computed') {
+      return '<variable ' + base + ' formula="' + x(v.formula || '') + '"/>';
+    }
+    if (v.kind === 'system') {
+      return '<variable ' + base + ' systemType="' + x(v.systemType || '') + '"/>';
+    }
+    if (v.kind === 'table') {
+      const cols = (v.columns || []).map(function (c, i) {
+        return '<col name="' + x(c) + '" type="' + x((v.columnTypes || [])[i] || 'STRING') + '"/>';
+      }).join('');
+      const rows = (v.rows || []).map(function (row) {
+        return '<row>' + (row || []).map(function (cell) { return '<cell>' + x(cell) + '</cell>'; }).join('') + '</row>';
+      }).join('');
+      return '<variable ' + base + '><columns>' + cols + '</columns><rows>' + rows + '</rows></variable>';
+    }
+    return '';
+  }).filter(Boolean).join('\n  ');
 
-  const tvEls = tableVariables.map(tv => {
-    const cols = tv.columns.map(c => `<col>${x(c)}</col>`).join('');
-    const rows = tv.rows.map(row =>
-      `<row>${row.map(cell => `<cell>${x(cell)}</cell>`).join('')}</row>`
-    ).join('\n        ');
-    return `<tableVariable name="${x(tv.name)}" group="${x(tv.group||'')}">` +
-           `<columns>${cols}</columns>` +
-           `<rows>\n        ${rows}\n      </rows>` +
-           `</tableVariable>`;
-  }).join('\n    ');
-
-  return `<?xml version="1.0" encoding="UTF-8"?>\n` +
-         `<livedocVariables xmlns="${XML_NS}">\n` +
-         `  <variables>\n    ${varEls}\n  </variables>\n` +
-         `  <tableVariables>\n    ${tvEls}\n  </tableVariables>\n` +
-         `</livedocVariables>`;
+  return '<?xml version="1.0" encoding="UTF-8"?>\n' +
+         '<livedocVariables xmlns="' + XML_NS + '" version="2">\n  ' +
+         els + '\n</livedocVariables>';
 }
 
-function parseXml(xmlStr) {
-  if (!xmlStr || typeof xmlStr !== 'string' || !xmlStr.trim()) throw new Error('Empty XML');
+// ── XML v2 — Parse ─────────────────────────────────────────────────────────────
+function parseXmlV2(xmlStr) {
   const doc = new DOMParser().parseFromString(xmlStr, 'text/xml');
   if (doc.querySelector('parsererror')) throw new Error('Malformed XML');
-
-  // Use getElementsByTagName (namespace-agnostic) — querySelectorAll fails on namespaced XML
   variables = [];
-  Array.from(doc.getElementsByTagName('variable')).forEach(el => {
+  Array.from(doc.getElementsByTagName('variable')).forEach(function (el) {
+    const kind = el.getAttribute('kind') || 'scalar';
+    const base = {
+      id:    el.getAttribute('id')    || uid(),
+      kind:  kind,
+      name:  el.getAttribute('name')  || '',
+      group: el.getAttribute('group') || '',
+    };
+    if (kind === 'scalar') {
+      variables.push(Object.assign({}, base, {
+        type:         el.getAttribute('type')         || 'STRING',
+        defaultValue: el.getAttribute('defaultValue') || '',
+      }));
+    } else if (kind === 'computed') {
+      variables.push(Object.assign({}, base, {
+        formula: el.getAttribute('formula') || '',
+      }));
+    } else if (kind === 'system') {
+      const systemType = el.getAttribute('systemType') || '';
+      const preset     = SYSTEM_PRESETS[systemType] || {};
+      variables.push(Object.assign({}, base, {
+        systemType:  systemType,
+        columns:     preset.columns     || [],
+        columnTypes: preset.columnTypes || [],
+      }));
+    } else if (kind === 'table') {
+      const cols       = Array.from(el.getElementsByTagName('col'));
+      const columns    = cols.map(function (c) { return c.getAttribute('name') || ''; });
+      const columnTypes= cols.map(function (c) { return c.getAttribute('type') || 'STRING'; });
+      const rows       = Array.from(el.getElementsByTagName('row')).map(function (row) {
+        return Array.from(row.getElementsByTagName('cell')).map(function (c) { return c.textContent; });
+      });
+      variables.push(Object.assign({}, base, { columns: columns, columnTypes: columnTypes, rows: rows }));
+    }
+  });
+}
+
+// ── XML v1 — Migrate ───────────────────────────────────────────────────────────
+function parseXmlV1(xmlStr) {
+  const doc = new DOMParser().parseFromString(xmlStr, 'text/xml');
+  if (doc.querySelector('parsererror')) throw new Error('Malformed XML');
+  variables = [];
+  Array.from(doc.getElementsByTagName('variable')).forEach(function (el) {
     variables.push({
+      id:           uid(),
+      kind:         'scalar',
       name:         el.getAttribute('name')         || '',
       type:         el.getAttribute('type')         || 'STRING',
       defaultValue: el.getAttribute('defaultValue') || '',
       group:        el.getAttribute('group')        || '',
     });
   });
-
-  tableVariables = [];
-  Array.from(doc.getElementsByTagName('tableVariable')).forEach(el => {
-    tableVariables.push({
-      name:    el.getAttribute('name')  || '',
-      group:   el.getAttribute('group') || '',
-      columns: Array.from(el.getElementsByTagName('col')).map(c => c.textContent),
-      rows:    Array.from(el.getElementsByTagName('row')).map(row =>
-                 Array.from(row.getElementsByTagName('cell')).map(c => c.textContent)),
+  Array.from(doc.getElementsByTagName('tableVariable')).forEach(function (el) {
+    const columns = Array.from(el.getElementsByTagName('col')).map(function (c) { return c.textContent; });
+    const rows    = Array.from(el.getElementsByTagName('row')).map(function (row) {
+      return Array.from(row.getElementsByTagName('cell')).map(function (c) { return c.textContent; });
+    });
+    variables.push({
+      id:          uid(),
+      kind:        'table',
+      name:        el.getAttribute('name')  || '',
+      group:       el.getAttribute('group') || '',
+      columns:     columns,
+      columnTypes: columns.map(function () { return 'STRING'; }),
+      rows:        rows,
     });
   });
 }
 
-// ─── Insert {{token}} at cursor ───────────────────────────────────────────────
-function insertVariable(name) {
-  const token = `{{${name}}}`;
-  Office.context.document.setSelectedDataAsync(
-    token,
-    { coercionType: Office.CoercionType.Text },
-    (result) => {
-      if (result.status === Office.AsyncResultStatus.Succeeded) {
-        showStatus(`Inserted: ${token}`, 'success');
-      } else {
-        showStatus(`Insert failed: ${result.error.message} — click inside a text box first.`, 'error');
+// ── Insert token at cursor ─────────────────────────────────────────────────────
+function insertVariable(id) {
+  const v = variables.find(function (v) { return v.id === id; });
+  if (!v) return;
+
+  if (v.kind === 'table' || (v.kind === 'system' && (v.columns || []).length > 0)) {
+    insertTableShape(v);
+  } else {
+    const token = '{{' + v.name + '}}';
+    Office.context.document.setSelectedDataAsync(
+      token,
+      { coercionType: Office.CoercionType.Text },
+      function (result) {
+        if (result.status === Office.AsyncResultStatus.Succeeded) {
+          showStatus('Inserted: ' + token, 'success');
+        } else {
+          showStatus('Click inside a text box on the slide first, then insert.', 'error');
+        }
       }
-    }
-  );
+    );
+  }
 }
 
-// ─── Insert table as PPT table shape ─────────────────────────────────────────
-async function insertTableVariable(name) {
-  const tv = tableVariables.find(t => t.name === name);
-  if (!tv) { showStatus('Table variable not found.', 'error'); return; }
+// ── Insert table shape on current slide ───────────────────────────────────────
+async function insertTableShape(v) {
+  const columns  = v.columns  || [];
+  const rows     = v.rows     || [];
+  const colCount = columns.length;
+  if (colCount === 0) { showStatus('Table has no columns defined.', 'error'); return; }
 
-  const rowCount  = tv.rows.length + 1;
-  const colCount  = tv.columns.length;
+  const rowCount  = rows.length + 1; // +1 for header
   const tblWidth  = Math.min(680, Math.max(280, colCount * 130));
-  const tblHeight = rowCount * 36;
+  const tblHeight = Math.max(40, rowCount * 36);
 
   try {
-    await PowerPoint.run(async (context) => {
+    await PowerPoint.run(async function (context) {
       let slide;
       try {
         const sel = context.presentation.getSelectedSlides();
         sel.load('items');
         await context.sync();
         slide = sel.items[0];
-      } catch (_e) {
+      } catch (_) {
         slide = context.presentation.slides.getItemAt(0);
-        showStatus('Inserting on slide 1 (getSelectedSlides unsupported)', 'info');
       }
 
       const shape = slide.shapes.addTable(rowCount, colCount, {
         left: 50, top: 120, width: tblWidth, height: tblHeight,
       });
-
-      // Must sync before accessing shape.table rows
       await context.sync();
 
       const tbl = shape.table;
+      // Header row
       for (let c = 0; c < colCount; c++) {
-        tbl.rows.getItemAt(0).cells.getItemAt(c).text = tv.columns[c] || '';
+        tbl.rows.getItemAt(0).cells.getItemAt(c).text = columns[c] || '';
       }
-      for (let r = 0; r < tv.rows.length; r++) {
+      // Data rows (empty for system vars — filled at runtime)
+      for (let r = 0; r < rows.length; r++) {
         for (let c = 0; c < colCount; c++) {
-          tbl.rows.getItemAt(r + 1).cells.getItemAt(c).text = tv.rows[r][c] || '';
+          tbl.rows.getItemAt(r + 1).cells.getItemAt(c).text = (rows[r] || [])[c] || '';
         }
       }
-
       await context.sync();
-      showStatus(`Table "${name}" inserted (${rowCount} rows × ${colCount} cols)`, 'success');
+      showStatus('Inserted table "' + v.name + '" (' + rowCount + ' rows \xd7 ' + colCount + ' cols).', 'success');
     });
   } catch (err) {
-    showStatus(`Table insert failed: ${err.message}`, 'error');
+    showStatus('Table insert failed: ' + err.message, 'error');
   }
 }
 
-// ─── Variable CRUD ────────────────────────────────────────────────────────────
-function addVariable() {
-  const name  = document.getElementById('varName').value.trim();
-  const type  = document.getElementById('varType').value;
-  const value = document.getElementById('varValue').value.trim();
-  const group = document.getElementById('varGroup').value.trim();
-
-  if (!name) { showStatus('Variable name is required.', 'error'); return; }
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-    showStatus('Name must start with a letter/underscore and contain only A-Z, 0-9, _.', 'error');
-    return;
-  }
-  if (variables.find(v => v.name === name)) {
-    showStatus(`Variable "${name}" already exists.`, 'error'); return;
-  }
-
-  variables.push({ name, type, defaultValue: value, group });
-  document.getElementById('varName').value  = '';
-  document.getElementById('varValue').value = '';
-  document.getElementById('varGroup').value = '';
-
-  saveToCustomXml(`Variable "${name}" added.`);
-  renderVariableTree();
+// ── Delete ─────────────────────────────────────────────────────────────────────
+function deleteVariable(id) {
+  const v = variables.find(function (v) { return v.id === id; });
+  if (!v) return;
+  if (!confirm('Delete "' + v.name + '"?')) return;
+  variables = variables.filter(function (v) { return v.id !== id; });
+  expandedIds.delete(id);
+  if (editId === id) closeDrawer();
+  saveToCustomXml('"' + v.name + '" deleted.');
+  renderTree();
 }
 
-function deleteVariable(name) {
-  variables = variables.filter(v => v.name !== name);
-  saveToCustomXml(`Variable "${name}" deleted.`);
-  renderVariableTree();
+// ── Edit drawer ────────────────────────────────────────────────────────────────
+function openEditDrawer(id) {
+  const v = variables.find(function (v) { return v.id === id; });
+  if (!v || v.kind === 'system') return;
+  editMode = 'edit';
+  editKind = v.kind;
+  editId   = id;
+  buildDrawerForm(v.kind, v);
+  openDrawer('Edit ' + kindLabel(v.kind) + ': ' + v.name);
 }
 
-// ─── Table variable CRUD ──────────────────────────────────────────────────────
-function addTableVariable() {
-  const name  = document.getElementById('tvName').value.trim();
-  const group = document.getElementById('tvGroup').value.trim();
-  const csv   = document.getElementById('tvCsv').value.trim();
+function buildDrawerForm(kind, data) {
+  const form = document.getElementById('drawerForm');
+  let html   = '';
 
-  if (!name) { showStatus('Table variable name is required.', 'error'); return; }
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-    showStatus('Name must start with a letter/underscore and contain only A-Z, 0-9, _.', 'error');
-    return;
-  }
-  if (tableVariables.find(t => t.name === name)) {
-    showStatus(`Table variable "${name}" already exists.`, 'error'); return;
-  }
-  if (!csv) { showStatus('CSV data is required.', 'error'); return; }
+  if (kind === 'scalar') {
+    const typeOpts = ['STRING', 'NUMBER', 'DATE', 'BOOLEAN'].map(function (t) {
+      return '<option value="' + t + '"' + (data && data.type === t ? ' selected' : '') + '>' + t + '</option>';
+    }).join('');
+    html = '<div class="form-row"><label>Name</label>' +
+           '<input id="df-name" class="field" spellcheck="false" autocomplete="off" value="' + (data ? h(data.name) : '') + '"/></div>' +
+           '<div class="form-row"><label>Type</label>' +
+           '<select id="df-type" class="field">' + typeOpts + '</select></div>' +
+           '<div class="form-row"><label>Default Value</label>' +
+           '<input id="df-value" class="field" value="' + (data ? h(data.defaultValue || '') : '') + '"/></div>' +
+           '<div class="form-row"><label>Group</label>' +
+           '<input id="df-group" class="field" placeholder="e.g. Client Info" value="' + (data ? h(data.group || '') : '') + '"/></div>';
 
-  const lines   = csv.split('\n').map(l => l.trim()).filter(Boolean);
-  const columns = lines[0].split(',').map(c => c.trim());
-  const rows    = lines.slice(1).map(line => {
-    const cells = line.split(',').map(c => c.trim());
+  } else if (kind === 'table') {
+    const csvVal = data ? buildCsv(data) : '';
+    html = '<div class="form-row"><label>Name</label>' +
+           '<input id="df-name" class="field" spellcheck="false" autocomplete="off" value="' + (data ? h(data.name) : '') + '"/></div>' +
+           '<div class="form-row"><label>Group</label>' +
+           '<input id="df-group" class="field" placeholder="e.g. Financial" value="' + (data ? h(data.group || '') : '') + '"/></div>' +
+           '<div class="form-row form-col"><label>CSV <span class="opt">first row = column headers</span></label>' +
+           '<textarea id="df-csv" class="field textarea" rows="4">' + h(csvVal) + '</textarea></div>';
+
+  } else if (kind === 'computed') {
+    html = '<div class="form-row"><label>Name</label>' +
+           '<input id="df-name" class="field" spellcheck="false" autocomplete="off" value="' + (data ? h(data.name) : '') + '"/></div>' +
+           '<div class="form-row"><label>Formula</label>' +
+           '<input id="df-formula" class="field mono" placeholder="=SUM(A1:A10)" value="' + (data ? h(data.formula || '') : '') + '"/></div>' +
+           '<div class="form-row"><label>Group</label>' +
+           '<input id="df-group" class="field" value="' + (data ? h(data.group || 'Computed') : 'Computed') + '"/></div>' +
+           '<p class="form-hint">Formula is evaluated server-side by the Livedoc engine (SpreadSheetGear).</p>';
+
+  } else if (kind === 'system') {
+    const presetOpts = Object.entries(SYSTEM_PRESETS).map(function (kv) {
+      return '<option value="' + kv[0] + '">' + kv[0] + ' — ' + kv[1].description + '</option>';
+    }).join('');
+    html = '<div class="form-row"><label>Preset</label>' +
+           '<select id="df-preset" class="field">' + presetOpts + '</select></div>' +
+           '<p class="form-hint">System variables are predefined and evaluated at runtime by the engine. They are read-only in the panel.</p>';
+  }
+
+  form.innerHTML = html;
+}
+
+function buildCsv(tv) {
+  const lines = [(tv.columns || []).join(',')];
+  (tv.rows || []).forEach(function (row) { lines.push(row.join(',')); });
+  return lines.join('\n');
+}
+
+function openDrawer(title) {
+  document.getElementById('drawerTitle').textContent = title;
+  document.getElementById('editDrawer').classList.remove('collapsed');
+}
+
+function closeDrawer() {
+  document.getElementById('editDrawer').classList.add('collapsed');
+  editId = null;
+}
+
+function saveDrawer() {
+  if      (editKind === 'scalar')   saveScalar();
+  else if (editKind === 'table')    saveTable();
+  else if (editKind === 'computed') saveComputed();
+  else if (editKind === 'system')   saveSystem();
+}
+
+function saveScalar() {
+  const name  = (document.getElementById('df-name')  || {}).value || '';
+  const type  = (document.getElementById('df-type')  || {}).value || 'STRING';
+  const value = (document.getElementById('df-value') || {}).value || '';
+  const group = (document.getElementById('df-group') || {}).value || '';
+
+  if (!validateName(name.trim())) return;
+  if (nameConflict(name.trim())) return;
+
+  upsertVariable({
+    id: editId || uid(), kind: 'scalar',
+    name: name.trim(), type: type, defaultValue: value.trim(), group: group.trim(),
+  });
+  closeDrawer();
+  saveToCustomXml('"' + name.trim() + '" ' + (editMode === 'edit' ? 'updated.' : 'added.'));
+  renderTree();
+}
+
+function saveTable() {
+  const name  = (document.getElementById('df-name')  || {}).value || '';
+  const group = (document.getElementById('df-group') || {}).value || '';
+  const csv   = (document.getElementById('df-csv')   || {}).value || '';
+
+  if (!validateName(name.trim())) return;
+  if (nameConflict(name.trim())) return;
+  if (!csv.trim()) { showStatus('CSV data is required.', 'error'); return; }
+
+  const lines      = csv.trim().split('\n').map(function (l) { return l.trim(); }).filter(Boolean);
+  const columns    = lines[0].split(',').map(function (c) { return c.trim(); });
+  const columnTypes= columns.map(function () { return 'STRING'; });
+  const rows       = lines.slice(1).map(function (line) {
+    const cells = line.split(',').map(function (c) { return c.trim(); });
     while (cells.length < columns.length) cells.push('');
     return cells.slice(0, columns.length);
   });
 
-  tableVariables.push({ name, group, columns, rows });
-  document.getElementById('tvName').value  = '';
-  document.getElementById('tvGroup').value = '';
-  document.getElementById('tvCsv').value   = '';
+  // Preserve existing column types when editing
+  if (editMode === 'edit' && editId) {
+    const existing = variables.find(function (v) { return v.id === editId; });
+    if (existing && existing.columnTypes) {
+      columns.forEach(function (col, i) {
+        const prevIdx = (existing.columns || []).indexOf(col);
+        if (prevIdx >= 0) columnTypes[i] = existing.columnTypes[prevIdx];
+      });
+    }
+  }
 
-  saveToCustomXml(`Table variable "${name}" added.`);
-  renderTableVariableTree();
+  upsertVariable({
+    id: editId || uid(), kind: 'table',
+    name: name.trim(), group: group.trim(), columns: columns, columnTypes: columnTypes, rows: rows,
+  });
+  closeDrawer();
+  saveToCustomXml('"' + name.trim() + '" ' + (editMode === 'edit' ? 'updated.' : 'added.'));
+  renderTree();
 }
 
-function deleteTableVariable(name) {
-  tableVariables = tableVariables.filter(t => t.name !== name);
-  saveToCustomXml(`Table variable "${name}" deleted.`);
-  renderTableVariableTree();
+function saveComputed() {
+  const name    = (document.getElementById('df-name')    || {}).value || '';
+  const formula = (document.getElementById('df-formula') || {}).value || '';
+  const group   = (document.getElementById('df-group')   || {}).value || '';
+
+  if (!validateName(name.trim())) return;
+  if (nameConflict(name.trim())) return;
+
+  upsertVariable({
+    id: editId || uid(), kind: 'computed',
+    name: name.trim(), formula: formula.trim(), group: group.trim() || 'Computed',
+  });
+  closeDrawer();
+  saveToCustomXml('"' + name.trim() + '" ' + (editMode === 'edit' ? 'updated.' : 'added.'));
+  renderTree();
 }
 
-// ─── Rendering ────────────────────────────────────────────────────────────────
-function renderAll() {
-  renderVariableTree();
-  renderTableVariableTree();
+function saveSystem() {
+  const preset = (document.getElementById('df-preset') || {}).value;
+  if (!preset || !SYSTEM_PRESETS[preset]) { showStatus('Please select a preset.', 'error'); return; }
+  if (variables.find(function (v) { return v.kind === 'system' && v.systemType === preset; })) {
+    showStatus('"' + preset + '" is already in the panel.', 'error'); return;
+  }
+  const p = SYSTEM_PRESETS[preset];
+  upsertVariable({
+    id: uid(), kind: 'system', name: preset, systemType: preset, group: 'System',
+    columns: p.columns, columnTypes: p.columnTypes,
+  });
+  closeDrawer();
+  saveToCustomXml('System variable "' + preset + '" added.');
+  renderTree();
 }
 
-function renderVariableTree() {
+function upsertVariable(entry) {
+  if (editMode === 'edit' && editId) {
+    const idx = variables.findIndex(function (v) { return v.id === editId; });
+    if (idx >= 0) { variables[idx] = entry; return; }
+  }
+  variables.push(entry);
+}
+
+function validateName(name) {
+  if (!name) { showStatus('Name is required.', 'error'); return false; }
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    showStatus('Name must start with a letter or underscore, and contain only A–Z, 0–9, _.', 'error');
+    return false;
+  }
+  return true;
+}
+
+function nameConflict(name) {
+  const conflict = variables.find(function (v) {
+    return v.name === name && v.id !== editId;
+  });
+  if (conflict) { showStatus('"' + name + '" already exists.', 'error'); return true; }
+  return false;
+}
+
+// ── Tree rendering ─────────────────────────────────────────────────────────────
+function renderTree() {
   const container = document.getElementById('varTree');
   document.getElementById('varCount').textContent = variables.length;
 
-  if (variables.length === 0) {
-    container.innerHTML = `
-      <div class="tree-empty">
-        <div class="tree-empty-icon">📋</div>
-        No variables yet — add one above.
-      </div>`;
+  const filtered = searchQuery
+    ? variables.filter(function (v) {
+        return v.name.toLowerCase().includes(searchQuery) ||
+               (v.group || '').toLowerCase().includes(searchQuery);
+      })
+    : variables;
+
+  if (!filtered.length) {
+    container.innerHTML = variables.length === 0
+      ? '<div class="tree-empty"><div class="tree-empty-icon">&#128203;</div>No variables yet — click <b>+ Add</b> to start.</div>'
+      : '<div class="tree-empty"><div class="tree-empty-icon">&#128269;</div>No matches for &ldquo;' + h(searchQuery) + '&rdquo;.</div>';
     return;
   }
 
-  const grouped = groupBy(variables, v => v.group || '');
-  container.innerHTML = buildGroupedTree(grouped, renderVarRow);
-  wireGroupToggles(container);
-}
-
-function renderVarRow(v) {
-  const type  = v.type || 'STRING';
-  const label = TYPE_LABELS[type] || type.slice(0, 3);
-  const val   = v.defaultValue ? h(v.defaultValue) : '<em style="color:#bbb">—</em>';
-  return `
-    <div class="tree-var-row">
-      <span class="type-badge badge-${h(type)}" title="${h(type)}">${label}</span>
-      <div class="var-info">
-        <div class="var-name">${h(v.name)}</div>
-        <div class="var-value">${val}</div>
-      </div>
-      <div class="tree-actions">
-        <button class="act-btn act-insert" onclick="insertVariable('${j(v.name)}')" title="Insert at cursor">→</button>
-        <button class="act-btn act-delete" onclick="deleteVariable('${j(v.name)}')" title="Delete">✕</button>
-      </div>
-    </div>`;
-}
-
-function renderTableVariableTree() {
-  const container = document.getElementById('tvTree');
-  document.getElementById('tvCount').textContent = tableVariables.length;
-
-  if (tableVariables.length === 0) {
-    container.innerHTML = `
-      <div class="tree-empty">
-        <div class="tree-empty-icon">🗃</div>
-        No table variables yet — add one above.
-      </div>`;
-    return;
-  }
-
-  const grouped = groupBy(tableVariables, t => t.group || '');
-  container.innerHTML = buildGroupedTree(grouped, renderTvRow);
-  wireGroupToggles(container);
-}
-
-function renderTvRow(tv) {
-  const preview = tv.columns.length > 0 ? `${tv.columns.length} cols × ${tv.rows.length} rows` : '';
-  return `
-    <div class="tree-var-row">
-      <span class="type-badge badge-TABLE" title="TABLE">TBL</span>
-      <div class="var-info">
-        <div class="var-name">${h(tv.name)}</div>
-        <div class="var-value">${preview}</div>
-      </div>
-      <div class="tree-actions">
-        <button class="act-btn act-insert" onclick="insertTableVariable('${j(tv.name)}')" title="Insert table">→</button>
-        <button class="act-btn act-delete" onclick="deleteTableVariable('${j(tv.name)}')" title="Delete">✕</button>
-      </div>
-    </div>`;
-}
-
-// ─── Tree helpers ─────────────────────────────────────────────────────────────
-function groupBy(arr, keyFn) {
-  const map = new Map();
-  arr.forEach(item => {
-    const k = keyFn(item);
-    if (!map.has(k)) map.set(k, []);
-    map.get(k).push(item);
+  // Build group map (preserving insertion order, ungrouped = '' key)
+  const grouped = new Map();
+  filtered.forEach(function (v) {
+    const g = v.group || '';
+    if (!grouped.has(g)) grouped.set(g, []);
+    grouped.get(g).push(v);
   });
-  return map;
-}
 
-function buildGroupedTree(grouped, renderItem) {
   let html = '';
-  const ungrouped   = grouped.get('') || [];
-  const namedGroups = [...grouped.entries()].filter(([k]) => k !== '');
 
-  namedGroups.forEach(([groupName, items]) => {
-    html += `
-      <div class="tree-group">
-        <div class="tree-group-header">
-          <span class="folder-toggle">▾</span>
-          <span class="folder-icon">📁</span>
-          <span class="group-name">${h(groupName)}</span>
-          <span class="group-count">${items.length}</span>
-        </div>
-        <div class="tree-group-body">
-          ${items.map(renderItem).join('')}
-        </div>
-      </div>`;
+  // Ungrouped first
+  (grouped.get('') || []).forEach(function (v) { html += renderVarRow(v, false); });
+
+  // Named groups
+  grouped.forEach(function (items, group) {
+    if (!group) return;
+    html += '<div class="tree-group">' +
+            '<div class="tree-group-header">' +
+            '<span class="folder-toggle">&#9660;</span>' +
+            '<span class="folder-icon">&#128193;</span>' +
+            '<span class="group-name">' + h(group) + '</span>' +
+            '<span class="group-count">' + items.length + '</span>' +
+            '</div>' +
+            '<div class="tree-group-body">' +
+            items.map(function (v) { return renderVarRow(v, true); }).join('') +
+            '</div></div>';
   });
 
-  ungrouped.forEach(item => { html += renderItem(item); });
-  return html;
+  container.innerHTML = html;
+  wireGroupToggles(container);
+  wireExpandToggles(container);
+}
+
+function renderVarRow(v, inGroup) {
+  const inGroupClass = inGroup ? ' in-group' : '';
+  const isSystem     = v.kind === 'system';
+  const hasChildren  = (v.kind === 'table' || v.kind === 'system') && (v.columns || []).length > 0;
+  const isExpanded   = expandedIds.has(v.id);
+
+  // ── Badge ──────────────────────────────
+  let badge = '';
+  if (v.kind === 'scalar') {
+    const label = TYPE_LABELS[v.type || 'STRING'] || v.type;
+    badge = '<span class="type-badge badge-' + h(v.type || 'STRING') + '" title="' + h(v.type || 'STRING') + '">' + label + '</span>';
+  } else if (v.kind === 'table') {
+    badge = '<span class="type-badge badge-TABLE" title="Table Variable">TBL</span>';
+  } else if (v.kind === 'computed') {
+    badge = '<span class="type-badge badge-COMPUTED" title="Computed Variable">fx</span>';
+  } else if (v.kind === 'system') {
+    badge = '<span class="type-badge badge-SYSTEM" title="System Variable">SYS</span>';
+  }
+
+  // ── Subtitle ───────────────────────────
+  let subtitle = '';
+  if (v.kind === 'scalar') {
+    subtitle = v.defaultValue
+      ? h(v.defaultValue)
+      : '<em class="no-val">no default</em>';
+  } else if (v.kind === 'table') {
+    subtitle = (v.columns || []).length + ' cols \xd7 ' + (v.rows || []).length + ' rows';
+  } else if (v.kind === 'computed') {
+    subtitle = v.formula
+      ? '<span class="formula-preview">' + h(v.formula) + '</span>'
+      : '<em class="no-val">no formula</em>';
+  } else if (v.kind === 'system') {
+    subtitle = v.systemType || '';
+  }
+
+  // ── Expand toggle / spacer ─────────────
+  const toggleHtml = hasChildren
+    ? '<span class="row-expand-toggle" data-id="' + j(v.id) + '">' + (isExpanded ? '&#9660;' : '&#9654;') + '</span>'
+    : '<span class="row-expand-spacer"></span>';
+
+  // ── Action buttons ─────────────────────
+  const insertTitle = hasChildren ? 'Insert table on current slide' : 'Insert token at cursor';
+  const actInsert = '<button class="act-btn act-insert" onclick="insertVariable(\'' + j(v.id) + '\')" title="' + insertTitle + '">→</button>';
+  const actEdit   = !isSystem
+    ? '<button class="act-btn act-edit"   onclick="openEditDrawer(\'' + j(v.id) + '\')" title="Edit">✎</button>' : '';
+  const actDelete = !isSystem
+    ? '<button class="act-btn act-delete" onclick="deleteVariable(\'' + j(v.id) + '\')"  title="Delete">✕</button>' : '';
+
+  let rowHtml = '<div class="tree-var-row' + inGroupClass + '">' +
+                toggleHtml + badge +
+                '<div class="var-info">' +
+                  '<div class="var-name">' + h(v.name) + '</div>' +
+                  '<div class="var-value">' + subtitle + '</div>' +
+                '</div>' +
+                '<div class="tree-actions">' + actInsert + actEdit + actDelete + '</div>' +
+                '</div>';
+
+  // ── Expanded children (column names) ───
+  if (hasChildren && isExpanded) {
+    (v.columns || []).forEach(function (col, i) {
+      const ct    = (v.columnTypes || [])[i] || 'STRING';
+      const clbl  = TYPE_LABELS[ct] || ct.slice(0, 3);
+      rowHtml += '<div class="tree-var-row tree-child-row' + inGroupClass + '">' +
+                 '<span class="row-expand-spacer"></span>' +
+                 '<span class="row-expand-spacer"></span>' +
+                 '<span class="type-badge badge-' + h(ct) + '" title="' + h(ct) + '">' + clbl + '</span>' +
+                 '<div class="var-info"><div class="var-name">' + h(col) + '</div></div>' +
+                 '</div>';
+    });
+  }
+
+  return rowHtml;
 }
 
 function wireGroupToggles(container) {
-  container.querySelectorAll('.tree-group-header').forEach(header => {
-    header.addEventListener('click', () => {
-      const body   = header.nextElementSibling;
-      const toggle = header.querySelector('.folder-toggle');
-      const collapsed = body.classList.toggle('collapsed');
-      toggle.textContent = collapsed ? '▸' : '▾';
+  container.querySelectorAll('.tree-group-header').forEach(function (header) {
+    header.addEventListener('click', function () {
+      const body     = header.nextElementSibling;
+      const toggle   = header.querySelector('.folder-toggle');
+      const collapsed= body.classList.toggle('collapsed');
+      toggle.innerHTML = collapsed ? '&#9654;' : '&#9660;';
     });
   });
 }
 
-// ─── Status bar ───────────────────────────────────────────────────────────────
-let _statusTimer = null;
+function wireExpandToggles(container) {
+  container.querySelectorAll('.row-expand-toggle').forEach(function (btn) {
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (expandedIds.has(id)) { expandedIds.delete(id); }
+      else                     { expandedIds.add(id); }
+      renderTree();
+    });
+  });
+}
 
-function showStatus(msg, type = 'info') {
-  const el = document.getElementById('status');
-  el.textContent = msg;
-  el.className   = `status-bar ${type}`;
-  el.style.display = 'block';
+// ── Helpers ────────────────────────────────────────────────────────────────────
+function kindLabel(kind) {
+  var map = { scalar: 'Scalar Variable', table: 'Table Variable', computed: 'Computed Variable', system: 'System Variable' };
+  return map[kind] || kind;
+}
+
+function uid() {
+  return Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+}
+
+var _statusTimer = null;
+function showStatus(msg, type) {
+  type = type || 'info';
+  var el = document.getElementById('status');
+  el.textContent  = msg;
+  el.className    = 'status-bar ' + type;
+  el.style.display= 'block';
   clearTimeout(_statusTimer);
   if (type !== 'error') {
-    _statusTimer = setTimeout(() => { el.style.display = 'none'; }, 4000);
+    _statusTimer = setTimeout(function () { el.style.display = 'none'; }, 4000);
   }
 }
 
-// ─── Escape helpers ───────────────────────────────────────────────────────────
+// XML-safe attribute escape
 function x(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
                   .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
+// HTML-safe display escape
 function h(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+// JS single-quote escape for onclick attributes
 function j(s) {
   return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
 }

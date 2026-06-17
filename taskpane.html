@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Livedoc Variables</title>
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <link rel="stylesheet" href="taskpane.css"/>
 </head>
 <body>
@@ -35,7 +36,8 @@
     <span class="spacer"></span>
     <span id="varCount" class="count-badge">0</span>
     <div class="add-dropdown-wrap">
-      <button id="addBtn" class="btn-add">+ Add &#9662;</button>
+      <button class="btn-preview" onclick="previewDoc()" title="Replace all {{tokens}} with default values and download preview PPTX">&#9654; Preview</button>
+    <button id="addBtn" class="btn-add">+ Add &#9662;</button>
       <div id="addMenu" class="add-menu hidden">
         <button onclick="openAddDrawer('scalar')"><span class="menu-badge badge-NUMBER">123</span> Scalar Variable</button>
         <button onclick="openAddDrawer('table')"><span class="menu-badge badge-TABLE">TBL</span> Table Variable</button>

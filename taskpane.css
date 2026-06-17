@@ -121,6 +121,17 @@ html, body {
 }
 
 /* Add button + dropdown */
+.btn-preview {
+  padding: 3px 9px;
+  font-size: 11px; font-weight: 600;
+  background: #fff; color: #107c10;
+  border: 1px solid #107c10; border-radius: 3px;
+  cursor: pointer; font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+.btn-preview:hover { background: #107c10; color: #fff; }
+
 .add-dropdown-wrap { position: relative; }
 .btn-add {
   padding: 3px 10px;

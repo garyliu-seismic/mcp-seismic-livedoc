@@ -413,6 +413,7 @@ function closeDrawer() {
 }
 
 function saveDrawer() {
+  if (editMode === 'dynamic')     { saveDynamicTableConfig(); return; }
   if      (editKind === 'scalar')   saveScalar();
   else if (editKind === 'table')    saveTable();
   else if (editKind === 'computed') saveComputed();
@@ -682,6 +683,297 @@ function wireExpandToggles(container) {
   });
 }
 
+// ── Dynamic Table Settings ─────────────────────────────────────────────────────
+//
+// A PPT table shape is "tagged" as dynamic by storing a JSON config in
+// shape.tags under the key LIVEDOC_DYN_TABLE.  At preview time we:
+//   1. Scan all slides via Office.js API to collect those configs.
+//   2. In the JSZip pass, find the matching <p:graphicFrame> by shape name,
+//      clone the template <a:tr> rows for every data record, then drop the
+//      original template rows.
+
+async function openDynamicDrawer() {
+  editMode = 'dynamic';
+  openDrawer('Dynamic Table Settings');
+  document.getElementById('drawerForm').innerHTML =
+    '<p class="form-hint" style="padding:8px 0">Loading table shapes from current slide…</p>';
+  document.getElementById('drawerSaveBtn').textContent = 'Save Config';
+
+  var shapes;
+  try {
+    shapes = await loadCurrentSlideTableShapes();
+  } catch (e) {
+    document.getElementById('drawerForm').innerHTML =
+      '<p class="form-hint" style="color:#c00">Could not load slide shapes: ' + h(e.message) + '</p>';
+    return;
+  }
+  buildDynamicDrawerForm(shapes);
+}
+
+async function loadCurrentSlideTableShapes() {
+  var all = [], tables = [];
+  await PowerPoint.run(async function (context) {
+    var slide;
+    try {
+      var sel = context.presentation.getSelectedSlides();
+      sel.load('items');
+      await context.sync();
+      slide = sel.items[0];
+    } catch (_) {
+      slide = context.presentation.slides.getItemAt(0);
+    }
+    slide.shapes.load('items/name,items/type');
+    await context.sync();
+
+    slide.shapes.items.forEach(function (s) {
+      all.push({ name: s.name, type: s.type });
+      // ShapeType.table = 'Table' in Office.js string enum
+      if (s.type === 'Table' ||
+          (typeof PowerPoint.ShapeType !== 'undefined' && s.type === PowerPoint.ShapeType.table)) {
+        tables.push({ name: s.name });
+      }
+    });
+  });
+  // Fallback: if type-check found nothing, surface all shapes
+  return tables.length ? tables : all.map(function (s) { return { name: s.name + ' (' + s.type + ')' }; });
+}
+
+function buildDynamicDrawerForm(tableShapes) {
+  var form    = document.getElementById('drawerForm');
+  var tableVars = variables.filter(function (v) { return v.kind === 'table'; });
+
+  if (!tableShapes.length) {
+    form.innerHTML = '<p class="form-hint">No table shapes found on the current slide.<br>Insert a PowerPoint table first, then open this dialog.</p>';
+    return;
+  }
+  if (!tableVars.length) {
+    form.innerHTML = '<p class="form-hint">No table variables defined yet.<br>Add a Table Variable first.</p>';
+    return;
+  }
+
+  var shapeOpts = tableShapes.map(function (s) {
+    return '<option value="' + h(s.name) + '">' + h(s.name) + '</option>';
+  }).join('');
+
+  var varOpts = tableVars.map(function (v) {
+    return '<option value="' + h(v.name) + '">' + h(v.name) +
+           ' (' + (v.columns || []).length + ' cols)</option>';
+  }).join('');
+
+  form.innerHTML =
+    '<div class="form-row"><label>Slide Table</label>' +
+    '<select id="df-dyn-shape" class="field">' + shapeOpts + '</select></div>' +
+    '<div class="form-row"><label>Variable</label>' +
+    '<select id="df-dyn-var" class="field">' + varOpts + '</select></div>' +
+    '<div class="form-row"><label>Repeat Rows</label>' +
+    '<div class="row-range-wrap">' +
+    '<span class="range-label">From</span>' +
+    '<input id="df-dyn-from" class="field field-sm" type="number" min="1" value="2"/>' +
+    '<span class="range-label">To</span>' +
+    '<input id="df-dyn-to"   class="field field-sm" type="number" min="1" value="2"/>' +
+    '<span class="range-hint">(1-indexed row numbers)</span>' +
+    '</div></div>' +
+    '<p class="form-hint">Rows <b>From</b>–<b>To</b> in the slide table are the repeating template. ' +
+    'At preview they are expanded once per data record, then the template is removed.</p>';
+}
+
+function saveDynamicTableConfig() {
+  var shapeName = (document.getElementById('df-dyn-shape') || {}).value || '';
+  var varName   = (document.getElementById('df-dyn-var')   || {}).value || '';
+  var fromRow   = parseInt((document.getElementById('df-dyn-from') || {}).value || '1', 10);
+  var toRow     = parseInt((document.getElementById('df-dyn-to')   || {}).value || '1', 10);
+
+  if (!shapeName) { showStatus('Select a slide table shape.', 'error'); return; }
+  if (!varName)   { showStatus('Select a table variable.', 'error');    return; }
+  if (isNaN(fromRow) || isNaN(toRow) || fromRow < 1 || toRow < fromRow) {
+    showStatus('Repeating row range is invalid (From must be ≤ To).', 'error'); return;
+  }
+
+  var config = { variableName: varName, fromRow: fromRow, toRow: toRow };
+
+  PowerPoint.run(async function (context) {
+    var slide;
+    try {
+      var sel = context.presentation.getSelectedSlides();
+      sel.load('items');
+      await context.sync();
+      slide = sel.items[0];
+    } catch (_) {
+      slide = context.presentation.slides.getItemAt(0);
+    }
+
+    slide.shapes.load('items/name');
+    await context.sync();
+
+    var shape = slide.shapes.items.find(function (s) { return s.name === shapeName; });
+    if (!shape) {
+      showStatus('Shape "' + shapeName + '" not found on current slide.', 'error');
+      return;
+    }
+
+    shape.tags.add('LIVEDOC_DYN_TABLE', JSON.stringify(config));
+    await context.sync();
+
+    closeDrawer();
+    showStatus(
+      '"' + shapeName + '" → variable "' + varName +
+      '", template rows ' + fromRow + '–' + toRow + '. Run Preview to expand.',
+      'success'
+    );
+  }).catch(function (e) {
+    showStatus('Failed to tag shape: ' + e.message, 'error');
+  });
+}
+
+// Pre-scan all slides for dynamic table shape tags (called at preview start).
+// Returns: { slideIndex(1-based): [{shapeName, variableName, fromRow, toRow}] }
+async function scanDynamicTables() {
+  var result = {};
+
+  await PowerPoint.run(async function (context) {
+    var slides = context.presentation.slides;
+    slides.load('items');
+    await context.sync();
+
+    // Batch-load shape name+type for every slide
+    slides.items.forEach(function (slide) {
+      slide.shapes.load('items/name,items/type');
+    });
+    await context.sync();
+
+    // Collect table shapes per slide
+    var tableShapesBySlide = [];
+    slides.items.forEach(function (slide, si) {
+      var tShapes = slide.shapes.items.filter(function (s) {
+        return s.type === 'Table' ||
+               (typeof PowerPoint.ShapeType !== 'undefined' && s.type === PowerPoint.ShapeType.table);
+      });
+      if (tShapes.length) tableShapesBySlide.push({ slideIndex: si + 1, shapes: tShapes });
+    });
+
+    if (!tableShapesBySlide.length) return;
+
+    // Batch-load tags for all table shapes
+    tableShapesBySlide.forEach(function (entry) {
+      entry.shapes.forEach(function (s) { s.tags.load('items/key,items/value'); });
+    });
+    await context.sync();
+
+    // Extract LIVEDOC_DYN_TABLE configs
+    tableShapesBySlide.forEach(function (entry) {
+      entry.shapes.forEach(function (s) {
+        var dynTag = s.tags.items.find(function (t) { return t.key === 'LIVEDOC_DYN_TABLE'; });
+        if (!dynTag) return;
+        try {
+          var config = JSON.parse(dynTag.value);
+          if (!result[entry.slideIndex]) result[entry.slideIndex] = [];
+          result[entry.slideIndex].push(Object.assign({ shapeName: s.name }, config));
+        } catch (_) {}
+      });
+    });
+  });
+
+  return result;
+}
+
+// Expand dynamic table rows inside a single slide's XML string.
+// configs: [{shapeName, variableName, fromRow, toRow}]  (fromRow/toRow are 1-indexed)
+function expandDynamicTablesInXml(xml, configs) {
+  if (!configs || !configs.length) return xml;
+
+  var NS_P = 'http://schemas.openxmlformats.org/presentationml/2006/main';
+  var NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+
+  var parser = new DOMParser();
+  var doc    = parser.parseFromString(xml, 'application/xml');
+  if (doc.getElementsByTagName('parseerror').length) return xml;
+
+  var changed = false;
+
+  configs.forEach(function (config) {
+    var tv = variables.find(function (v) {
+      return v.name === config.variableName && v.kind === 'table';
+    });
+    if (!tv || !(tv.rows || []).length) return;
+
+    // Locate the <p:graphicFrame> whose <p:cNvPr name="shapeName"> matches
+    var nvFramePrs = doc.getElementsByTagNameNS(NS_P, 'nvGraphicFramePr');
+    var targetTbl  = null;
+
+    for (var fi = 0; fi < nvFramePrs.length; fi++) {
+      var nvPr   = nvFramePrs[fi];
+      var cNvPrs = nvPr.childNodes;
+      var found  = false;
+      for (var ci = 0; ci < cNvPrs.length; ci++) {
+        var child = cNvPrs[ci];
+        if (child.nodeType === 1 && child.localName === 'cNvPr' &&
+            child.getAttribute('name') === config.shapeName) {
+          found = true; break;
+        }
+      }
+      if (!found) continue;
+
+      // Walk up to the <p:graphicFrame>, then find <a:tbl>
+      var frame = nvPr.parentNode;
+      var tbls  = frame.getElementsByTagNameNS(NS_A, 'tbl');
+      if (tbls.length) { targetTbl = tbls[0]; break; }
+    }
+
+    if (!targetTbl) {
+      console.warn('[DynTable] Shape "' + config.shapeName + '" not found in slide XML.');
+      return;
+    }
+
+    // Direct <a:tr> children only (not nested)
+    var allRows = Array.from(targetTbl.childNodes).filter(function (n) {
+      return n.nodeType === 1 && n.localName === 'tr';
+    });
+    if (!allRows.length) return;
+
+    var fromIdx = (config.fromRow || 1) - 1; // convert to 0-indexed
+    var toIdx   = (config.toRow   || 1) - 1;
+    if (fromIdx < 0 || toIdx >= allRows.length || fromIdx > toIdx) {
+      console.warn('[DynTable] Row range ' + config.fromRow + '-' + config.toRow +
+                   ' out of bounds (table has ' + allRows.length + ' rows).');
+      return;
+    }
+
+    var templateRows = allRows.slice(fromIdx, toIdx + 1);
+    var insertBefore = templateRows[0];   // new rows go before the first template row
+
+    // For each data record: clone each template row and substitute {{ColName}}
+    tv.rows.forEach(function (dataRow) {
+      var rowMap = {};
+      (tv.columns || []).forEach(function (col, i) { rowMap[col] = (dataRow || [])[i] || ''; });
+
+      templateRows.forEach(function (templateRow) {
+        var newRow = templateRow.cloneNode(true);
+
+        // Replace {{ColName}} tokens inside every <a:t> text node
+        var tEls = newRow.getElementsByTagNameNS(NS_A, 't');
+        for (var ti = 0; ti < tEls.length; ti++) {
+          var tEl = tEls[ti];
+          tEl.textContent = tEl.textContent.replace(/\{\{(\w+)\}\}/g, function (match, colName) {
+            return Object.prototype.hasOwnProperty.call(rowMap, colName) ? rowMap[colName] : match;
+          });
+        }
+        targetTbl.insertBefore(newRow, insertBefore);
+      });
+    });
+
+    // Remove the original template rows
+    templateRows.forEach(function (r) { targetTbl.removeChild(r); });
+    changed = true;
+  });
+
+  if (!changed) return xml;
+
+  var serializer = new XMLSerializer();
+  var result = serializer.serializeToString(doc);
+  result = result.replace(/ xmlns=""/g, '');
+  return result;
+}
+
 // ── Preview — replace tokens and download PPTX ────────────────────────────────
 //
 // Flow: getFileAsync (sliced bytes) → JSZip → regex-replace {{Var}} in each
@@ -701,68 +993,82 @@ async function previewDoc() {
   showStatus('Building preview…', 'info');
 
   try {
-    // Build name → value map (scalar and computed only; tables insert as shapes)
+    // Step 1 — Scan all slides for dynamic table shape tags (Office.js API call)
+    var dynamicTableMap = await scanDynamicTables();
+    var dynSlideCount   = Object.keys(dynamicTableMap).length;
+
+    // Step 2 — Build scalar/computed replacement map
     var replacements = {};
     variables.forEach(function (v) {
       if (v.kind === 'scalar') {
         replacements[v.name] = v.defaultValue || '';
       } else if (v.kind === 'computed') {
-        // Show the formula itself as a placeholder (no engine available in browser)
         replacements[v.name] = v.formula ? '[' + v.formula + ']' : '';
       }
-      // table/system: leave {{Token}} as-is (they insert as PPT shapes, not inline text)
+      // table/system: handled separately — dynamic expansion or left as-is
     });
 
-    // Get PPTX bytes from the open document
+    // Step 3 — Get PPTX bytes
     var bytes = await getPptxBytes();
+    var zip   = await JSZip.loadAsync(bytes);
 
-    // Unzip
-    var zip = await JSZip.loadAsync(bytes);
+    // Ordered slide paths: slide1.xml → index 1, slide2.xml → index 2, …
+    var slidePaths = Object.keys(zip.files)
+      .filter(function (n) { return /^ppt\/slides\/slide\d+\.xml$/.test(n); })
+      .sort(function (a, b) {
+        return parseInt(a.match(/slide(\d+)\.xml/)[1]) -
+               parseInt(b.match(/slide(\d+)\.xml/)[1]);
+      });
 
-    // Find all slide XMLs: ppt/slides/slide1.xml, slide2.xml, …
-    var slideNames = Object.keys(zip.files).filter(function (name) {
-      return /^ppt\/slides\/slide\d+\.xml$/.test(name);
-    });
-
-    if (!slideNames.length) {
+    if (!slidePaths.length) {
       showStatus('No slides found in the PPTX — try saving the document first.', 'error');
       return;
     }
 
     var replacedCount = 0;
+    var expandedTables = 0;
 
-    for (var si = 0; si < slideNames.length; si++) {
-      var slidePath = slideNames[si];
-      var xml = await zip.files[slidePath].async('string');
+    for (var si = 0; si < slidePaths.length; si++) {
+      var slidePath    = slidePaths[si];
+      var slideIndex   = si + 1; // 1-based
+      var xml          = await zip.files[slidePath].async('string');
 
-      // Pass 1: Heal split runs inside each <a:p> paragraph so that tokens
-      //         fragmented across multiple <a:r> elements become contiguous.
+      // Pass A — expand dynamic table rows (before token replacement)
+      var dynConfigs = dynamicTableMap[slideIndex] || [];
+      if (dynConfigs.length) {
+        var before = xml;
+        xml = expandDynamicTablesInXml(xml, dynConfigs);
+        if (xml !== before) expandedTables += dynConfigs.length;
+      }
+
+      // Pass B — heal split-run tokens ({{Var}} fragmented across <a:r> runs)
       xml = healSplitTokenRuns(xml, replacements);
 
-      // Pass 2: Simple regex replacement — handles single-run tokens.
+      // Pass C — regex replace remaining scalar/computed tokens
       xml = xml.replace(/\{\{(\w+)\}\}/g, function (match, varName) {
         if (Object.prototype.hasOwnProperty.call(replacements, varName)) {
           replacedCount++;
           return xmlEscapeVal(replacements[varName]);
         }
-        return match; // unknown variable — leave token as-is
+        return match;
       });
 
       zip.file(slidePath, xml);
     }
 
-    // Re-zip and download
+    // Re-zip and trigger download
     var newBytes = await zip.generateAsync({
-      type:       'uint8array',
-      compression:'DEFLATE',
+      type: 'uint8array',
+      compression: 'DEFLATE',
       compressionOptions: { level: 6 },
     });
 
     downloadPptx(newBytes, 'preview.pptx');
-    showStatus(
-      'Preview downloaded — ' + replacedCount + ' token' + (replacedCount !== 1 ? 's' : '') + ' replaced across ' + slideNames.length + ' slide' + (slideNames.length !== 1 ? 's' : '') + '.',
-      'success'
-    );
+
+    var summary = 'Preview downloaded — ';
+    if (expandedTables)  summary += expandedTables + ' dynamic table(s) expanded, ';
+    summary += replacedCount + ' token(s) replaced across ' + slidePaths.length + ' slide(s).';
+    showStatus(summary, 'success');
 
   } catch (err) {
     showStatus('Preview failed: ' + err.message, 'error');

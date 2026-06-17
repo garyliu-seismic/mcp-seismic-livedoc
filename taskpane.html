@@ -36,7 +36,8 @@
     <span class="spacer"></span>
     <span id="varCount" class="count-badge">0</span>
     <div class="add-dropdown-wrap">
-      <button class="btn-preview" onclick="previewDoc()" title="Replace all {{tokens}} with default values and download preview PPTX">&#9654; Preview</button>
+      <button class="btn-preview"  onclick="previewDoc()"       title="Replace all {{tokens}} with default values and download preview PPTX">&#9654; Preview</button>
+    <button class="btn-dynamic"  onclick="openDynamicDrawer()" title="Tag a slide table shape as dynamic and link it to a table variable">&#8862; Dynamic</button>
     <button id="addBtn" class="btn-add">+ Add &#9662;</button>
       <div id="addMenu" class="add-menu hidden">
         <button onclick="openAddDrawer('scalar')"><span class="menu-badge badge-NUMBER">123</span> Scalar Variable</button>
@@ -58,7 +59,7 @@
     </div>
     <div id="drawerForm" class="drawer-form"></div>
     <div class="drawer-actions">
-      <button class="btn-primary" onclick="saveDrawer()">Save</button>
+      <button id="drawerSaveBtn" class="btn-primary" onclick="saveDrawer()">Save</button>
       <button class="btn-secondary" onclick="closeDrawer()">Cancel</button>
     </div>
   </div>

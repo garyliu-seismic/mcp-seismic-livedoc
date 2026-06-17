@@ -10,6 +10,9 @@ let editMode      = 'add';    // 'add' | 'edit'
 let editKind      = 'scalar';
 let editId        = null;
 
+// Tracks the name of the currently selected table shape in the slide (updated on selection change)
+let selectedTableName = null;
+
 const XML_NS    = 'http://schemas.livedoc.seismic.com/poc-variables/v2';
 const XML_NS_V1 = 'http://schemas.livedoc.seismic.com/poc-variables/v1';
 
@@ -32,6 +35,7 @@ Office.onReady((info) => {
     initSearch();
     initAddMenu();
     loadFromCustomXml();
+    initSelectionHandler();
   } else {
     document.getElementById('loading').innerHTML =
       '<p style="color:#c00;padding:20px">This add-in requires PowerPoint.</p>';
@@ -773,6 +777,89 @@ function evaluateFormula(formula) {
   }
 }
 
+// ── Selection tracking ─────────────────────────────────────────────────────────
+
+function initSelectionHandler() {
+  Office.context.document.addHandlerAsync(
+    Office.EventType.DocumentSelectionChanged,
+    onSlideSelectionChanged,
+    function (result) {
+      if (result.status !== Office.AsyncResultStatus.Succeeded) {
+        console.warn('SelectionChanged handler registration failed:', result.error && result.error.message);
+      }
+    }
+  );
+}
+
+async function onSlideSelectionChanged() {
+  try {
+    await PowerPoint.run(async function (context) {
+      var shapes;
+      try {
+        shapes = context.presentation.getSelectedShapes();
+        shapes.load('items/name,items/type');
+        await context.sync();
+      } catch (_) {
+        // getSelectedShapes not available (API < 1.5) or nothing selected
+        selectedTableName = null;
+        return;
+      }
+
+      var table = shapes.items.find(function (s) {
+        return s.type === 'Table' ||
+               (typeof PowerPoint !== 'undefined' &&
+                typeof PowerPoint.ShapeType !== 'undefined' &&
+                s.type === PowerPoint.ShapeType.table);
+      });
+
+      selectedTableName = table ? table.name : null;
+
+      // If the Dynamic Table Settings drawer is already open, sync all fields
+      if (editMode === 'dynamic' && selectedTableName) {
+        // Sync the Slide Table dropdown
+        var sel = document.getElementById('df-dyn-shape');
+        if (sel) {
+          for (var i = 0; i < sel.options.length; i++) {
+            if (sel.options[i].value === selectedTableName) { sel.selectedIndex = i; break; }
+          }
+        }
+
+        // Load the existing LIVEDOC_DYN_TABLE tag so Variable/From/To reflect this shape
+        try {
+          table.tags.load('items/key,items/value');
+          await context.sync();
+          var dynTag = table.tags.items.find(function (t) { return t.key === 'LIVEDOC_DYN_TABLE'; });
+          syncDynamicDrawerFromConfig(dynTag ? JSON.parse(dynTag.value) : null);
+        } catch (_) {
+          // Tag load failed — leave Variable/Rows as-is
+        }
+      }
+    });
+  } catch (_) {
+    selectedTableName = null;
+  }
+}
+
+// Sync the Variable dropdown and Repeat Rows fields to an existing config (or reset to defaults).
+function syncDynamicDrawerFromConfig(config) {
+  var varSel = document.getElementById('df-dyn-var');
+  var fromEl = document.getElementById('df-dyn-from');
+  var toEl   = document.getElementById('df-dyn-to');
+  if (!varSel || !fromEl || !toEl) return;
+
+  if (config) {
+    for (var i = 0; i < varSel.options.length; i++) {
+      if (varSel.options[i].value === config.variableName) { varSel.selectedIndex = i; break; }
+    }
+    fromEl.value = config.fromRow || 1;
+    toEl.value   = config.toRow   || 1;
+  } else {
+    varSel.selectedIndex = 0;
+    fromEl.value = 2;
+    toEl.value   = 2;
+  }
+}
+
 // ── Dynamic Table Settings ─────────────────────────────────────────────────────
 //
 // A PPT table shape is "tagged" as dynamic by storing a JSON config in
@@ -842,7 +929,8 @@ function buildDynamicDrawerForm(tableShapes) {
   }
 
   var shapeOpts = tableShapes.map(function (s) {
-    return '<option value="' + h(s.name) + '">' + h(s.name) + '</option>';
+    var sel = (selectedTableName && s.name === selectedTableName) ? ' selected' : '';
+    return '<option value="' + h(s.name) + '"' + sel + '>' + h(s.name) + '</option>';
   }).join('');
 
   var varOpts = tableVars.map(function (v) {

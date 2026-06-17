@@ -256,6 +256,22 @@ function parseXmlV1(xmlStr) {
   });
 }
 
+// ── Insert a raw {{token}} string at the current cursor position ──────────────
+function insertToken(tokenName) {
+  var token = '{{' + tokenName + '}}';
+  Office.context.document.setSelectedDataAsync(
+    token,
+    { coercionType: Office.CoercionType.Text },
+    function (result) {
+      if (result.status === Office.AsyncResultStatus.Succeeded) {
+        showStatus('Inserted: ' + token, 'success');
+      } else {
+        showStatus('Click inside a text box or table cell first, then insert.', 'error');
+      }
+    }
+  );
+}
+
 // ── Insert token at cursor ─────────────────────────────────────────────────────
 function insertVariable(id) {
   const v = variables.find(function (v) { return v.id === id; });
@@ -646,13 +662,16 @@ function renderVarRow(v, inGroup) {
   // ── Expanded children (column names) ───
   if (hasChildren && isExpanded) {
     (v.columns || []).forEach(function (col, i) {
-      const ct    = (v.columnTypes || [])[i] || 'STRING';
-      const clbl  = TYPE_LABELS[ct] || ct.slice(0, 3);
+      const ct   = (v.columnTypes || [])[i] || 'STRING';
+      const clbl = TYPE_LABELS[ct] || ct.slice(0, 3);
       rowHtml += '<div class="tree-var-row tree-child-row' + inGroupClass + '">' +
                  '<span class="row-expand-spacer"></span>' +
                  '<span class="row-expand-spacer"></span>' +
                  '<span class="type-badge badge-' + h(ct) + '" title="' + h(ct) + '">' + clbl + '</span>' +
                  '<div class="var-info"><div class="var-name">' + h(col) + '</div></div>' +
+                 '<div class="tree-actions">' +
+                 '<button class="act-btn act-insert" onclick="insertToken(\'' + j(col) + '\')" title="Insert {{' + h(col) + '}} at cursor">→</button>' +
+                 '</div>' +
                  '</div>';
     });
   }

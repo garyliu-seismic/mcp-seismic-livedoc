@@ -13,6 +13,7 @@ let editId        = null;
 // Tracks the name of the currently selected table shape in the slide (updated on selection change)
 let selectedTableName   = null;
 let selectedShapeName   = null;   // any non-indicator shape — used by dynimage drawer
+let selectedChartName   = null;   // any shape selected while dynchart drawer is open
 let currentSlideId      = null;   // Tracks current slide; used to detect slide switches
 let pendingImageDataUrl = null;   // file uploaded in the dynimage drawer; survives form rebuilds
 
@@ -438,6 +439,7 @@ function closeDrawer() {
 function saveDrawer() {
   if (editMode === 'dynamic')    { saveDynamicTableConfig();  return; }
   if (editMode === 'dynimage')   { saveDynamicImageConfig();  return; }
+  if (editMode === 'dynchart')   { saveDynamicChartConfig();  return; }
   if      (editKind === 'scalar')   saveScalar();
   else if (editKind === 'table')    saveTable();
   else if (editKind === 'computed') saveComputed();
@@ -853,6 +855,7 @@ async function onSlideSelectionChanged() {
     if (newSlideId !== null) currentSlideId = newSlideId;
     selectedTableName = foundTable ? foundTable.name : null;
     selectedShapeName = foundShape ? foundShape.name : null;
+    if (editMode === 'dynchart') selectedChartName = foundShape ? foundShape.name : null;
 
     if (editMode === 'dynamic') {
       if (slideChanged) {
@@ -867,6 +870,12 @@ async function onSlideSelectionChanged() {
       } else if (selectedShapeName) {
         syncDynamicImageDrawerDropdown(selectedShapeName);
         syncDynamicImageDrawerFromConfig(imgConfig);
+      }
+    } else if (editMode === 'dynchart') {
+      if (slideChanged) {
+        await refreshDynamicChartDrawer();
+      } else if (selectedChartName) {
+        syncDynamicChartDrawerDropdown(selectedChartName);
       }
     }
   } catch (_) {
@@ -1292,6 +1301,183 @@ function onImageFileSelected(input) {
     pendingImageDataUrl = null;
     if (statusEl) statusEl.innerHTML = '<span style="color:#c00">File read failed.</span>';
   });
+}
+
+// ── Dynamic Chart Settings ─────────────────────────────────────────────────────
+//
+// A slide chart shape is tagged with LIVEDOC_DYN_CHART: { titleVar, tableVar, labelCol, valueCol }
+// The chart shape itself stays on the slide (the sample data is the visual placeholder).
+// At preview time we navigate: slide XML → slide rels → ppt/charts/chartN.xml
+// and replace cached chart data (title, <c:strCache> category labels, <c:numCache> values).
+//
+// UI mirrors the COM add-in: Binding Table Variable + Chart Title Variable +
+// a series grid row "(Category)" with Legend (label col) and Data (value col) pickers.
+
+async function openDynamicChartDrawer() {
+  editMode = 'dynchart';
+  openDrawer('Dynamic Chart Settings');
+  document.getElementById('drawerForm').innerHTML =
+    '<p class="form-hint" style="padding:8px 0">Loading shapes from current slide…</p>';
+  document.getElementById('drawerSaveBtn').textContent = 'Save Config';
+
+  var shapes;
+  try {
+    shapes = await loadCurrentSlideAllShapes();
+  } catch (e) {
+    document.getElementById('drawerForm').innerHTML =
+      '<p class="form-hint" style="color:#c00">Could not load shapes: ' + h(e.message) + '</p>';
+    return;
+  }
+  buildDynamicChartDrawerForm(shapes);
+}
+
+async function refreshDynamicChartDrawer() {
+  var form = document.getElementById('drawerForm');
+  if (!form) return;
+  form.innerHTML = '<p class="form-hint" style="padding:8px 0">Loading shapes from current slide…</p>';
+  try {
+    var shapes = await loadCurrentSlideAllShapes();
+    buildDynamicChartDrawerForm(shapes);
+  } catch (e) {
+    form.innerHTML = '<p class="form-hint" style="color:#c00">Could not load shapes: ' + h(e.message) + '</p>';
+  }
+}
+
+function syncDynamicChartDrawerDropdown(shapeName) {
+  var sel = document.getElementById('df-chart-shape');
+  if (!sel || !shapeName) return;
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === shapeName) { sel.selectedIndex = i; break; }
+  }
+}
+
+function buildDynamicChartDrawerForm(shapes) {
+  var form       = document.getElementById('drawerForm');
+  var tableVars  = variables.filter(function (v) { return v.kind === 'table'; });
+  var scalarVars = variables.filter(function (v) { return v.kind === 'scalar'; });
+
+  if (!shapes.length) {
+    form.innerHTML = '<p class="form-hint">No shapes found on the current slide.</p>';
+    return;
+  }
+  if (!tableVars.length) {
+    form.innerHTML = '<p class="form-hint">No table variables defined. Add a Table Variable first.</p>';
+    return;
+  }
+
+  var shapeOpts = shapes.map(function (s) {
+    var sel = (selectedChartName && s.name === selectedChartName) ? ' selected' : '';
+    return '<option value="' + h(s.name) + '"' + sel + '>' + h(s.name) + ' (' + h(s.type) + ')</option>';
+  }).join('');
+
+  var titleOpts = '<option value="">(none)</option>' + scalarVars.map(function (v) {
+    return '<option value="' + h(v.name) + '">' + h(v.name) + '</option>';
+  }).join('');
+
+  var tableOpts = tableVars.map(function (v) {
+    return '<option value="' + h(v.name) + '">' + h(v.name) +
+           ' (' + (v.columns || []).length + ' cols)</option>';
+  }).join('');
+
+  // Default column options from the first table variable
+  var firstTable = tableVars[0];
+  var colOpts = (firstTable.columns || []).map(function (c) {
+    return '<option value="' + h(c) + '">' + h(c) + '</option>';
+  }).join('');
+  // Auto-select second column for value if available
+  var valueColOpts = (firstTable.columns || []).map(function (c, i) {
+    var sel = (i === 1) ? ' selected' : '';
+    return '<option value="' + h(c) + '"' + sel + '>' + h(c) + '</option>';
+  }).join('');
+
+  form.innerHTML =
+    '<div class="form-row"><label>Chart Shape</label>' +
+    '<select id="df-chart-shape" class="field">' + shapeOpts + '</select></div>' +
+    '<div class="form-row"><label>Binding Table Variable</label>' +
+    '<select id="df-chart-table" class="field" onchange="onChartTableChanged()">' + tableOpts + '</select></div>' +
+    '<div class="form-row"><label>Chart Title Variable</label>' +
+    '<select id="df-chart-title" class="field">' + titleOpts + '</select></div>' +
+    '<div class="chart-series-grid">' +
+    '<div class="chart-series-header">' +
+    '<span class="csg-name">Name</span>' +
+    '<span class="csg-legend">Legend <span class="opt">(label col)</span></span>' +
+    '<span class="csg-data">Data <span class="opt">(value col)</span></span>' +
+    '</div>' +
+    '<div class="chart-series-row">' +
+    '<span class="csg-name">(Category)</span>' +
+    '<select id="df-chart-label" class="field csg-legend">' + colOpts + '</select>' +
+    '<select id="df-chart-value" class="field csg-data">' + valueColOpts + '</select>' +
+    '</div></div>' +
+    '<p class="form-hint">Click the chart shape on the slide to auto-select it above. ' +
+    'At preview, title and pie data are replaced with variable values.</p>';
+}
+
+// Called when the Binding Table Variable dropdown changes — refreshes column pickers.
+function onChartTableChanged() {
+  var tableName = (document.getElementById('df-chart-table') || {}).value || '';
+  var tv = variables.find(function (v) { return v.name === tableName && v.kind === 'table'; });
+  var cols = tv ? (tv.columns || []) : [];
+
+  var colOpts = cols.map(function (c) {
+    return '<option value="' + h(c) + '">' + h(c) + '</option>';
+  }).join('');
+  var valueColOpts = cols.map(function (c, i) {
+    var sel = (i === 1) ? ' selected' : '';
+    return '<option value="' + h(c) + '"' + sel + '>' + h(c) + '</option>';
+  }).join('');
+
+  var labelSel = document.getElementById('df-chart-label');
+  var valueSel = document.getElementById('df-chart-value');
+  if (labelSel) labelSel.innerHTML = colOpts;
+  if (valueSel) valueSel.innerHTML = valueColOpts;
+}
+
+async function saveDynamicChartConfig() {
+  var shapeName = (document.getElementById('df-chart-shape') || {}).value || '';
+  var tableVar  = (document.getElementById('df-chart-table') || {}).value || '';
+  var titleVar  = (document.getElementById('df-chart-title') || {}).value || '';
+  var labelCol  = (document.getElementById('df-chart-label') || {}).value || '';
+  var valueCol  = (document.getElementById('df-chart-value') || {}).value || '';
+
+  if (!shapeName) { showStatus('Select a chart shape.', 'error'); return; }
+  if (!tableVar)  { showStatus('Select a binding table variable.', 'error'); return; }
+  if (!labelCol)  { showStatus('Select a Legend (label) column.', 'error'); return; }
+  if (!valueCol)  { showStatus('Select a Data (value) column.', 'error'); return; }
+
+  var config = { titleVar: titleVar || '', tableVar: tableVar, labelCol: labelCol, valueCol: valueCol };
+
+  try {
+    await PowerPoint.run(async function (context) {
+      var slide;
+      try {
+        var sel = context.presentation.getSelectedSlides();
+        sel.load('items');
+        await context.sync();
+        slide = sel.items[0];
+      } catch (_) {
+        slide = context.presentation.slides.getItemAt(0);
+      }
+
+      slide.shapes.load('items/name');
+      await context.sync();
+
+      var shape = slide.shapes.items.find(function (s) { return s.name === shapeName; });
+      if (!shape) { showStatus('Shape "' + shapeName + '" not found on current slide.', 'error'); return; }
+
+      shape.tags.add('LIVEDOC_DYN_CHART', JSON.stringify(config));
+      await context.sync();
+
+      closeDrawer();
+      showStatus(
+        '"' + shapeName + '" linked to table "' + tableVar +
+        '"' + (titleVar ? ', title → "' + titleVar + '"' : '') +
+        '. Run Preview to update chart data.',
+        'success'
+      );
+    });
+  } catch (e) {
+    showStatus('Failed to tag chart: ' + e.message, 'error');
+  }
 }
 
 // Pre-scan all slides for dynamic table shape tags (called at preview start).
@@ -1755,6 +1941,237 @@ function getImageDimensions(bytes, mimeType) {
   });
 }
 
+// ── Dynamic Chart — scan & expand ─────────────────────────────────────────────
+//
+// scanDynamicCharts(): reads LIVEDOC_DYN_CHART tags from all slides.
+// expandDynamicChartsInXml(): for each tagged chart navigates the relationship chain:
+//   slide XML → slide rels → ppt/charts/chartN.xml
+// and updates the cached chart data (title, category labels, series values).
+// The chart shape itself is not replaced in the slide XML.
+
+async function scanDynamicCharts() {
+  var result = {};
+
+  await PowerPoint.run(async function (context) {
+    var slides = context.presentation.slides;
+    slides.load('items');
+    await context.sync();
+
+    slides.items.forEach(function (slide) {
+      slide.shapes.load('items/name');
+    });
+    await context.sync();
+
+    var shapesBySlide = [];
+    slides.items.forEach(function (slide, si) {
+      var nonInd = slide.shapes.items.filter(function (s) {
+        return !s.name.startsWith('__LIVEDOC_IND_');
+      });
+      if (nonInd.length) shapesBySlide.push({ slideIndex: si + 1, shapes: nonInd });
+    });
+
+    if (!shapesBySlide.length) return;
+
+    shapesBySlide.forEach(function (entry) {
+      entry.shapes.forEach(function (s) { s.tags.load('items/key,items/value'); });
+    });
+    await context.sync();
+
+    shapesBySlide.forEach(function (entry) {
+      entry.shapes.forEach(function (s) {
+        var tag = s.tags.items.find(function (t) { return t.key === 'LIVEDOC_DYN_CHART'; });
+        if (!tag) return;
+        try {
+          var config = JSON.parse(tag.value);
+          if (!result[entry.slideIndex]) result[entry.slideIndex] = [];
+          result[entry.slideIndex].push(Object.assign({ shapeName: s.name }, config));
+        } catch (_) {}
+      });
+    });
+  });
+
+  return result;
+}
+
+// Modify ppt/charts/chartN.xml in-place for each tagged chart on this slide.
+// Returns the slide XML unchanged (only chart files are modified in the zip).
+async function expandDynamicChartsInXml(zip, xml, slideIndex, configs) {
+  if (!configs || !configs.length) return xml;
+
+  var NS_P = 'http://schemas.openxmlformats.org/presentationml/2006/main';
+  var NS_C = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
+  var NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+
+  var slideDoc = new DOMParser().parseFromString(xml, 'application/xml');
+  if (slideDoc.getElementsByTagName('parseerror').length) return xml;
+
+  var relsPath = 'ppt/slides/_rels/slide' + slideIndex + '.xml.rels';
+  var relsXml  = zip.files[relsPath] ? await zip.files[relsPath].async('string') : '';
+
+  for (var ci = 0; ci < configs.length; ci++) {
+    var cfg = configs[ci];
+
+    // Step 1: locate the chart's r:id in the slide XML via <p:graphicFrame> lookup
+    var rId = findChartRIdInSlideDoc(slideDoc, cfg.shapeName, NS_P, NS_C, NS_R);
+    if (!rId) {
+      console.warn('[DynChart] Chart shape "' + cfg.shapeName + '" not found in slide XML.');
+      continue;
+    }
+
+    // Step 2: resolve the chart file path from the slide rels
+    var relTarget = findRelTargetById(relsXml, rId);
+    if (!relTarget) {
+      console.warn('[DynChart] Rel "' + rId + '" not found in slide rels.');
+      continue;
+    }
+    var chartPath = resolveRelativePath('ppt/slides/', relTarget);
+
+    if (!zip.files[chartPath]) {
+      console.warn('[DynChart] Chart file "' + chartPath + '" not in zip.');
+      continue;
+    }
+
+    // Step 3: load chart XML and resolve variable data
+    var chartXml = await zip.files[chartPath].async('string');
+
+    var titleValue  = null;
+    var labelValues = null;
+    var numValues   = null;
+
+    if (cfg.titleVar) {
+      var tv = variables.find(function (v) { return v.name === cfg.titleVar && v.kind === 'scalar'; });
+      if (tv) titleValue = tv.defaultValue || '';
+    }
+
+    if (cfg.tableVar) {
+      var tbl = variables.find(function (v) { return v.name === cfg.tableVar && v.kind === 'table'; });
+      if (tbl) {
+        var labelIdx = (tbl.columns || []).indexOf(cfg.labelCol);
+        var valueIdx = (tbl.columns || []).indexOf(cfg.valueCol);
+        var rows = tbl.rows || [];
+        if (labelIdx >= 0) labelValues = rows.map(function (r) { return (r || [])[labelIdx] || ''; });
+        if (valueIdx >= 0) numValues   = rows.map(function (r) { return (r || [])[valueIdx] || '0'; });
+      }
+    }
+
+    // Step 4: update chart XML and save back to zip
+    var updatedChartXml = updateChartCachedData(chartXml, titleValue, labelValues, numValues);
+    zip.file(chartPath, updatedChartXml);
+  }
+
+  return xml; // slide XML is unchanged
+}
+
+// Find the r:id attribute on <c:chart> inside the <p:graphicFrame> named shapeName.
+function findChartRIdInSlideDoc(slideDoc, shapeName, NS_P, NS_C, NS_R) {
+  var frames = slideDoc.getElementsByTagNameNS(NS_P, 'graphicFrame');
+  for (var i = 0; i < frames.length; i++) {
+    var frame  = frames[i];
+    var nvPr   = frame.getElementsByTagNameNS(NS_P, 'nvGraphicFramePr')[0];
+    if (!nvPr) continue;
+    var cNvPr  = findChildByLocalName(nvPr, 'cNvPr');
+    if (!cNvPr || cNvPr.getAttribute('name') !== shapeName) continue;
+
+    var chartEls = frame.getElementsByTagNameNS(NS_C, 'chart');
+    if (!chartEls.length) continue;
+    // r:id is a namespace-qualified attribute in NS_R
+    var rId = chartEls[0].getAttributeNS(NS_R, 'id') || chartEls[0].getAttribute('r:id');
+    return rId || null;
+  }
+  return null;
+}
+
+// Scan rels XML string for the Target of a given relationship Id.
+function findRelTargetById(relsXml, rId) {
+  var escaped = rId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  var idx = relsXml.search(new RegExp('Id="' + escaped + '"'));
+  if (idx < 0) return null;
+  var snippet = relsXml.slice(idx);
+  var m = snippet.match(/Target="([^"]*)"/);
+  return m ? m[1] : null;
+}
+
+// Resolve a relative path from a base directory (e.g. "../charts/chart1.xml" from "ppt/slides/").
+function resolveRelativePath(baseDir, relTarget) {
+  var parts = (baseDir + relTarget).split('/');
+  var out = [];
+  parts.forEach(function (p) {
+    if (p === '..') out.pop();
+    else if (p && p !== '.') out.push(p);
+  });
+  return out.join('/');
+}
+
+// Update the cached data in a chart XML string and return the modified string.
+// Targets: <c:title> text, first <c:ser> <c:strCache> (labels), <c:numCache> (values).
+function updateChartCachedData(chartXml, titleValue, labelValues, numValues) {
+  var NS_C = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
+  var NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+
+  var doc = new DOMParser().parseFromString(chartXml, 'application/xml');
+  if (doc.getElementsByTagName('parseerror').length) return chartXml;
+
+  var changed = false;
+
+  // 1. Update chart title — find first <a:t> inside <c:title>
+  if (titleValue !== null) {
+    var titleEls = doc.getElementsByTagNameNS(NS_C, 'title');
+    if (titleEls.length) {
+      var tEls = titleEls[0].getElementsByTagNameNS(NS_A, 't');
+      if (tEls.length) {
+        tEls[0].textContent = titleValue;
+        for (var ti = 1; ti < tEls.length; ti++) tEls[ti].textContent = '';
+        changed = true;
+      }
+    }
+  }
+
+  // 2. Find the first <c:ser> (handles pie chart with a single series)
+  var serEls = doc.getElementsByTagNameNS(NS_C, 'ser');
+  if (serEls.length) {
+    var ser = serEls[0];
+
+    // 2a. Category labels → <c:cat><c:strRef><c:strCache>
+    if (labelValues && labelValues.length) {
+      var catEl = ser.getElementsByTagNameNS(NS_C, 'cat')[0];
+      if (catEl) {
+        var strCache = catEl.getElementsByTagNameNS(NS_C, 'strCache')[0];
+        if (strCache) { replaceChartCachePoints(doc, strCache, labelValues, NS_C, false); changed = true; }
+      }
+    }
+
+    // 2b. Numeric values → <c:val><c:numRef><c:numCache>
+    if (numValues && numValues.length) {
+      var valEl = ser.getElementsByTagNameNS(NS_C, 'val')[0];
+      if (valEl) {
+        var numCache = valEl.getElementsByTagNameNS(NS_C, 'numCache')[0];
+        if (numCache) { replaceChartCachePoints(doc, numCache, numValues, NS_C, true); changed = true; }
+      }
+    }
+  }
+
+  if (!changed) return chartXml;
+  return new XMLSerializer().serializeToString(doc).replace(/ xmlns=""/g, '');
+}
+
+// Replace <c:pt> entries inside a cache element (strCache or numCache).
+// Updates <c:ptCount val> and rebuilds <c:pt idx="N"><c:v>value</c:v></c:pt> entries.
+function replaceChartCachePoints(doc, cacheEl, values, NS_C, isNumeric) {
+  Array.from(cacheEl.getElementsByTagNameNS(NS_C, 'pt')).forEach(function (pt) {
+    pt.parentNode.removeChild(pt);
+  });
+  var ptCount = cacheEl.getElementsByTagNameNS(NS_C, 'ptCount')[0];
+  if (ptCount) ptCount.setAttribute('val', String(values.length));
+  values.forEach(function (val, idx) {
+    var pt = doc.createElementNS(NS_C, 'c:pt');
+    pt.setAttribute('idx', String(idx));
+    var v = doc.createElementNS(NS_C, 'c:v');
+    v.textContent = isNumeric ? String(parseFloat(val) || 0) : String(val);
+    pt.appendChild(v);
+    cacheEl.appendChild(pt);
+  });
+}
+
 // ── Preview — replace tokens and download PPTX ────────────────────────────────
 //
 // Flow: getFileAsync (sliced bytes) → JSZip → regex-replace {{Var}} in each
@@ -1777,6 +2194,7 @@ async function previewDoc() {
     // Step 1 — Scan all slides for dynamic configs (Office.js API calls)
     var dynamicTableMap = await scanDynamicTables();
     var dynamicImageMap = await scanDynamicImages();
+    var dynamicChartMap = await scanDynamicCharts();
     var dynSlideCount   = Object.keys(dynamicTableMap).length;
 
     // Step 2 — Build scalar/computed replacement map
@@ -1810,6 +2228,7 @@ async function previewDoc() {
     var replacedCount  = 0;
     var expandedTables = 0;
     var expandedImages = 0;
+    var expandedCharts = 0;
 
     for (var si = 0; si < slidePaths.length; si++) {
       var slidePath    = slidePaths[si];
@@ -1829,6 +2248,13 @@ async function previewDoc() {
       var imgConfigs = dynamicImageMap[slideIndex] || [];
       xml = await expandDynamicImagesInXml(zip, xml, slideIndex, imgConfigs);
       if (imgConfigs.length) expandedImages += imgConfigs.length;
+
+      // Pass A3 — update dynamic chart cached data (modifies chartN.xml files in zip)
+      var chartConfigs = dynamicChartMap[slideIndex] || [];
+      if (chartConfigs.length) {
+        await expandDynamicChartsInXml(zip, xml, slideIndex, chartConfigs);
+        expandedCharts += chartConfigs.length;
+      }
 
       // Pass B — heal split-run tokens ({{Var}} fragmented across <a:r> runs)
       xml = healSplitTokenRuns(xml, replacements);
@@ -1857,6 +2283,7 @@ async function previewDoc() {
     var summary = 'Preview downloaded — ';
     if (expandedTables) summary += expandedTables + ' dynamic table(s) expanded, ';
     if (expandedImages) summary += expandedImages + ' dynamic image(s) replaced, ';
+    if (expandedCharts) summary += expandedCharts + ' dynamic chart(s) updated, ';
     summary += replacedCount + ' token(s) replaced across ' + slidePaths.length + ' slide(s).';
     showStatus(summary, 'success');
 

@@ -154,6 +154,38 @@ html, body {
 }
 .btn-dynimage:hover { background: #edfaf2; border-color: #1a6b3a; }
 
+.btn-dynchart {
+  padding: 3px 9px;
+  font-size: 11px; font-weight: 600;
+  background: #fff; color: #1a4d8a;
+  border: 1px solid #b0c8e8; border-radius: 3px;
+  cursor: pointer; font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+.btn-dynchart:hover { background: #eef4fc; border-color: #1a4d8a; }
+
+/* Series grid inside Dynamic Chart drawer */
+.chart-series-grid {
+  border: 1px solid #d0d9e5;
+  border-radius: 4px;
+  margin: 8px 0 4px;
+  overflow: hidden;
+}
+.chart-series-header {
+  display: flex; gap: 6px; padding: 5px 8px;
+  background: #f0f4fa;
+  font-size: 10px; font-weight: 700; color: #445;
+  border-bottom: 1px solid #d0d9e5;
+}
+.chart-series-row {
+  display: flex; gap: 6px; padding: 6px 8px; align-items: center;
+  font-size: 11px;
+}
+.csg-name   { flex: 0 0 72px; font-style: italic; color: #556; }
+.csg-legend { flex: 1; }
+.csg-data   { flex: 1; }
+
 /* Row-range input row inside Dynamic drawer */
 .row-range-wrap {
   display: flex; align-items: center;

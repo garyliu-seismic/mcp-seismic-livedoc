@@ -2107,6 +2107,9 @@ async function expandDynamicChartsInXml(zip, xml, slideIndex, configs) {
     // Step 4: update chart XML and save back to zip
     var updatedChartXml = updateChartCachedData(chartXml, titleValue, labelValues, numValues);
     zip.file(chartPath, updatedChartXml);
+
+    // Step 5: update the embedded Excel workbook so "Edit Data" shows consistent data
+    await updateChartEmbeddedExcel(zip, chartPath, chartXml, labelValues, numValues);
   }
 
   return xml; // slide XML is unchanged
@@ -2164,6 +2167,97 @@ function resolveRelativePath(baseDir, relTarget) {
     else if (p && p !== '.') out.push(p);
   });
   return out.join('/');
+}
+
+// Update the embedded Excel workbook so "Edit Data" in PowerPoint shows the same data
+// as the chart visual.  The XLSX is a nested ZIP inside the PPTX; we load it with
+// JSZip, patch sheet1.xml, and re-embed it.
+async function updateChartEmbeddedExcel(zip, chartPath, chartXml, labelValues, numValues) {
+  if (!labelValues || !numValues || !labelValues.length) return;
+
+  // Find the externalData rId embedded in the chart XML
+  var extMatch = chartXml.match(/externalData[^>]+r:id="([^"]+)"/);
+  if (!extMatch) extMatch = chartXml.match(/externalData[^>]+id="([^"]+)"/);
+  if (!extMatch) return;
+  var extRId = extMatch[1];
+
+  // Load chart rels to resolve the Excel package path
+  var chartFilename = chartPath.substring(chartPath.lastIndexOf('/') + 1);
+  var chartDir      = chartPath.substring(0, chartPath.lastIndexOf('/') + 1);
+  var chartRelsPath = chartDir + '_rels/' + chartFilename + '.rels';
+  if (!zip.files[chartRelsPath]) return;
+
+  var chartRelsXml = await zip.files[chartRelsPath].async('string');
+  var excelTarget  = findRelTargetById(chartRelsXml, extRId);
+  if (!excelTarget) return;
+
+  var excelPath = resolveRelativePath(chartDir, excelTarget);
+  if (!zip.files[excelPath]) return;
+
+  // Load the XLSX as a nested JSZip, update it, then re-embed
+  var excelBytes = await zip.files[excelPath].async('uint8array');
+  var excelZip;
+  try { excelZip = await JSZip.loadAsync(excelBytes); } catch (e) { return; }
+
+  var wsPath = 'xl/worksheets/sheet1.xml';
+  if (!excelZip.files[wsPath]) return;
+
+  var wsXml = await excelZip.files[wsPath].async('string');
+  excelZip.file(wsPath, updateExcelWorksheetData(wsXml, labelValues, numValues));
+
+  // Extend/shrink the table range (table1.xml) to match new row count
+  var tablePath = 'xl/tables/table1.xml';
+  if (excelZip.files[tablePath]) {
+    var tableXml = await excelZip.files[tablePath].async('string');
+    var newEnd = 'A1:D' + (1 + labelValues.length);
+    excelZip.file(tablePath, tableXml.replace(/\bref="[^"]+"/g, 'ref="' + newEnd + '"'));
+  }
+
+  var newExcelBytes = await excelZip.generateAsync({
+    type: 'uint8array',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 }
+  });
+  zip.file(excelPath, newExcelBytes);
+}
+
+// Rebuild rows 2+ in a SpreadsheetML worksheet with our variable data.
+// Category labels use t="inlineStr" to avoid touching sharedStrings.xml.
+function updateExcelWorksheetData(wsXml, labelValues, numValues) {
+  var NS  = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+  var doc = new DOMParser().parseFromString(wsXml, 'application/xml');
+  if (doc.getElementsByTagName('parseerror').length) return wsXml;
+
+  // Update <dimension ref="A1:DN"> to reflect new row count
+  var dim = doc.getElementsByTagNameNS(NS, 'dimension')[0];
+  if (dim) dim.setAttribute('ref', 'A1:D' + (1 + labelValues.length));
+
+  var sheetData = doc.getElementsByTagNameNS(NS, 'sheetData')[0];
+  if (!sheetData) return wsXml;
+
+  // Remove all existing data rows (keep row 1 = headers)
+  Array.from(sheetData.getElementsByTagNameNS(NS, 'row')).forEach(function (r) {
+    if (parseInt(r.getAttribute('r') || '1', 10) >= 2) sheetData.removeChild(r);
+  });
+
+  // Append new data rows
+  var count = Math.min(labelValues.length, numValues.length);
+  for (var i = 0; i < count; i++) {
+    var rn  = i + 2;
+    var lbl = xmlEscapeVal(String(labelValues[i] || ''));
+    var val = parseFloat(numValues[i]) || 0;
+    var rowXml =
+      '<row xmlns="' + NS + '" r="' + rn + '">' +
+        '<c r="A' + rn + '" t="inlineStr"><is><t>' + lbl + '</t></is></c>' +
+        '<c r="B' + rn + '"><v>' + val + '</v></c>' +
+      '</row>';
+    var rowDoc = new DOMParser().parseFromString(rowXml, 'application/xml');
+    if (!rowDoc.getElementsByTagName('parseerror').length) {
+      sheetData.appendChild(doc.importNode(rowDoc.documentElement, true));
+    }
+  }
+
+  return new XMLSerializer().serializeToString(doc);
 }
 
 // Update chart data using literal elements (<c:strLit>/<c:numLit>) instead of cached refs.

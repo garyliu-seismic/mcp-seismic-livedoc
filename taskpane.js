@@ -11,9 +11,10 @@ let editKind      = 'scalar';
 let editId        = null;
 
 // Tracks the name of the currently selected table shape in the slide (updated on selection change)
-let selectedTableName = null;
-let selectedShapeName = null; // any non-indicator shape — used by dynimage drawer
-let currentSlideId    = null; // Tracks current slide; used to detect slide switches
+let selectedTableName   = null;
+let selectedShapeName   = null;   // any non-indicator shape — used by dynimage drawer
+let currentSlideId      = null;   // Tracks current slide; used to detect slide switches
+let pendingImageDataUrl = null;   // file uploaded in the dynimage drawer; survives form rebuilds
 
 const XML_NS    = 'http://schemas.livedoc.seismic.com/poc-variables/v2';
 const XML_NS_V1 = 'http://schemas.livedoc.seismic.com/poc-variables/v1';
@@ -1071,6 +1072,7 @@ function saveDynamicTableConfig() {
 
 async function openDynamicImageDrawer() {
   editMode = 'dynimage';
+  pendingImageDataUrl = null;
   openDrawer('Dynamic Image Settings');
   document.getElementById('drawerForm').innerHTML =
     '<p class="form-hint" style="padding:8px 0">Loading shapes from current slide…</p>';
@@ -1123,6 +1125,10 @@ function buildDynamicImageDrawerForm(shapes) {
     return '<option value="' + h(s.name) + '"' + sel + '>' + h(s.name) + ' (' + h(s.type) + ')</option>';
   }).join('');
 
+  var fileStatusMsg = pendingImageDataUrl
+    ? '<span style="color:#1a6b3a">✓ File loaded — ready to save</span>'
+    : '';
+
   form.innerHTML =
     '<div class="form-row"><label>Placeholder Shape</label>' +
     '<select id="df-img-shape" class="field">' + shapeOpts + '</select></div>' +
@@ -1136,7 +1142,9 @@ function buildDynamicImageDrawerForm(shapes) {
     '<div class="form-row form-col"><label>Image URL</label>' +
     '<input id="df-img-url" class="field" type="url" placeholder="https://example.com/photo.jpg"/></div>' +
     '<div class="form-row form-col"><label>— or upload local file —</label>' +
-    '<input id="df-img-file" type="file" accept="image/*" class="field"/></div>' +
+    '<input id="df-img-file" type="file" accept="image/*" class="field" onchange="onImageFileSelected(this)"/>' +
+    '<div id="df-img-file-status" class="form-hint" style="margin-top:2px">' + fileStatusMsg + '</div>' +
+    '</div>' +
     '<p class="form-hint">At preview the placeholder is replaced by the image, fitted to its bounds. ' +
     'A 📷 indicator is added to the slide to show the binding.</p>';
 }
@@ -1182,13 +1190,19 @@ async function saveDynamicImageConfig() {
 
   if (!shapeName) { showStatus('Select a placeholder shape.', 'error'); return; }
   var hasFile = fileInput && fileInput.files && fileInput.files.length > 0;
-  if (!url && !hasFile) { showStatus('Provide an image URL or upload a local file.', 'error'); return; }
+  if (!url && !hasFile && !pendingImageDataUrl) {
+    showStatus('Provide an image URL or upload a local file.', 'error'); return;
+  }
 
   var sourceUrl = url;
   if (!sourceUrl && hasFile) {
     try { sourceUrl = await readFileAsDataUrl(fileInput.files[0]); }
     catch (e) { showStatus('File read failed: ' + e.message, 'error'); return; }
   }
+  if (!sourceUrl && pendingImageDataUrl) {
+    sourceUrl = pendingImageDataUrl;
+  }
+  pendingImageDataUrl = null; // consumed
 
   var config = { fitMode: fitMode, sourceUrl: sourceUrl };
 
@@ -1239,6 +1253,26 @@ function readFileAsDataUrl(file) {
     reader.onload  = function (e) { resolve(e.target.result); };
     reader.onerror = function ()  { reject(new Error('File read failed')); };
     reader.readAsDataURL(file);
+  });
+}
+
+// Called by the file input onchange — reads the file immediately into
+// pendingImageDataUrl so the data survives if the drawer form is rebuilt.
+function onImageFileSelected(input) {
+  var statusEl = document.getElementById('df-img-file-status');
+  if (!input.files || !input.files.length) {
+    pendingImageDataUrl = null;
+    if (statusEl) statusEl.innerHTML = '';
+    return;
+  }
+  var file = input.files[0];
+  if (statusEl) statusEl.innerHTML = '<span style="color:#888">Reading file…</span>';
+  readFileAsDataUrl(file).then(function (dataUrl) {
+    pendingImageDataUrl = dataUrl;
+    if (statusEl) statusEl.innerHTML = '<span style="color:#1a6b3a">✓ Loaded: ' + h(file.name) + '</span>';
+  }).catch(function () {
+    pendingImageDataUrl = null;
+    if (statusEl) statusEl.innerHTML = '<span style="color:#c00">File read failed.</span>';
   });
 }
 
@@ -1581,15 +1615,21 @@ function findChildByLocalName(parent, localName) {
 }
 
 function findShapeBoundsInXml(slideDoc, shapeName, NS_P, NS_A) {
-  var spEls = slideDoc.getElementsByTagNameNS(NS_P, 'sp');
-  for (var i = 0; i < spEls.length; i++) {
-    var sp     = spEls[i];
-    var nvSpPr = sp.getElementsByTagNameNS(NS_P, 'nvSpPr')[0];
-    if (!nvSpPr) continue;
-    var cNvPr  = findChildByLocalName(nvSpPr, 'cNvPr');
+  // Search <p:sp> (regular shapes/textboxes) AND <p:pic> (image shapes).
+  // Both use nvSpPr/nvPicPr > cNvPr[@name] and spPr > a:xfrm for position.
+  var candidates = Array.from(slideDoc.getElementsByTagNameNS(NS_P, 'sp'))
+    .concat(Array.from(slideDoc.getElementsByTagNameNS(NS_P, 'pic')));
+
+  for (var i = 0; i < candidates.length; i++) {
+    var el    = candidates[i];
+    // nvSpPr for <p:sp>, nvPicPr for <p:pic>
+    var nvPr  = el.getElementsByTagNameNS(NS_P, 'nvSpPr')[0] ||
+                el.getElementsByTagNameNS(NS_P, 'nvPicPr')[0];
+    if (!nvPr) continue;
+    var cNvPr = findChildByLocalName(nvPr, 'cNvPr');
     if (!cNvPr || cNvPr.getAttribute('name') !== shapeName) continue;
 
-    var spPr = sp.getElementsByTagNameNS(NS_P, 'spPr')[0];
+    var spPr = el.getElementsByTagNameNS(NS_P, 'spPr')[0];
     if (!spPr) continue;
     var xfrm = spPr.getElementsByTagNameNS(NS_A, 'xfrm')[0];
     if (!xfrm) continue;
@@ -1598,7 +1638,7 @@ function findShapeBoundsInXml(slideDoc, shapeName, NS_P, NS_A) {
     if (!off || !ext) continue;
 
     return {
-      spEl:    sp,
+      spEl:    el,
       shapeId: cNvPr.getAttribute('id') || '99',
       x:   parseInt(off.getAttribute('x')  || '0', 10),
       y:   parseInt(off.getAttribute('y')  || '0', 10),

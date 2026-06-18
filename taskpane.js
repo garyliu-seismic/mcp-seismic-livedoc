@@ -1224,26 +1224,43 @@ async function saveDynamicImageConfig() {
       var shape = slide.shapes.items.find(function (s) { return s.name === shapeName; });
       if (!shape) { showStatus('Shape "' + shapeName + '" not found on current slide.', 'error'); return; }
 
-      shape.tags.add('LIVEDOC_DYN_IMAGE', JSON.stringify(config));
+      // Capture bounds before deleting
+      var left   = shape.left;
+      var top    = shape.top;
+      var width  = shape.width;
+      var height = shape.height;
 
-      // Remove any existing indicator for this shape, then add a fresh one
-      var indName = '__LIVEDOC_IND_' + shapeName;
-      var existing = slide.shapes.items.find(function (s) { return s.name === indName; });
-      if (existing) existing.delete();
+      // Remove the original shape and any stale indicator
+      shape.delete();
+      var staleInd = slide.shapes.items.find(function (s) { return s.name === '__LIVEDOC_IND_' + shapeName; });
+      if (staleInd) staleInd.delete();
       await context.sync();
 
-      var ind = slide.shapes.addTextBox('📷', {
-        left: shape.left, top: shape.top, width: 32, height: 24,
-      });
+      // Replace with a visually distinct placeholder textbox at the same bounds
+      var label = '📷  Dynamic Image\n' + shapeName;
+      var ph = slide.shapes.addTextBox(label, { left: left, top: top, width: width, height: height });
       await context.sync();
-      ind.name = indName;
+
+      ph.name = shapeName;                        // keep original name so OOXML lookup still works
+      ph.fill.setSolidColor('DCE8F8');            // light blue-gray — visually distinct from real content
+      ph.textFrame.textRange.font.size  = 14;
+      ph.textFrame.textRange.font.color = '3A5A8A';
+      ph.textFrame.textRange.font.bold  = false;
+      try {
+        // Center text if API available (requires 1.4+)
+        ph.textFrame.textRange.paragraphFormat.horizontalAlignment =
+          PowerPoint.ParagraphHorizontalAlignment.center;
+        ph.textFrame.verticalAlignment = PowerPoint.TextVerticalAlignment.middle;
+      } catch (_) {}
+
+      ph.tags.add('LIVEDOC_DYN_IMAGE', JSON.stringify(config));
       await context.sync();
 
       closeDrawer();
-      showStatus('"' + shapeName + '" tagged as dynamic image (' + fitMode + '). Run Preview to replace.', 'success');
+      showStatus('"' + shapeName + '" placeholder ready (' + fitMode + '). Run Preview to replace with the real image.', 'success');
     });
   } catch (e) {
-    showStatus('Failed to tag shape: ' + e.message, 'error');
+    showStatus('Failed to configure placeholder: ' + e.message, 'error');
   }
 }
 

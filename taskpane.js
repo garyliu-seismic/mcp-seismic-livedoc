@@ -799,11 +799,12 @@ function initSelectionHandler() {
 
 async function onSlideSelectionChanged() {
   try {
-    var newSlideId  = null;
-    var foundTable  = null;
-    var foundShape  = null; // any non-indicator shape
-    var dynConfig   = null;
-    var imgConfig   = null;
+    var newSlideId   = null;
+    var foundTable   = null;
+    var foundShape   = null; // any non-indicator shape
+    var dynConfig    = null;
+    var imgConfig    = null;
+    var chartConfig  = null;
 
     await PowerPoint.run(async function (context) {
       // Detect current slide ID so we can tell when the user switches slides
@@ -849,6 +850,16 @@ async function onSlideSelectionChanged() {
           imgConfig = imgTag ? JSON.parse(imgTag.value) : null;
         } catch (_) {}
       }
+
+      // Load dynamic chart config if chart drawer is open
+      if (editMode === 'dynchart' && foundShape) {
+        try {
+          foundShape.tags.load('items/key,items/value');
+          await context.sync();
+          var chartTag = foundShape.tags.items.find(function (t) { return t.key === 'LIVEDOC_DYN_CHART'; });
+          chartConfig = chartTag ? JSON.parse(chartTag.value) : null;
+        } catch (_) {}
+      }
     });
 
     var slideChanged  = (newSlideId !== null && newSlideId !== currentSlideId);
@@ -876,6 +887,7 @@ async function onSlideSelectionChanged() {
         await refreshDynamicChartDrawer();
       } else if (selectedChartName) {
         syncDynamicChartDrawerDropdown(selectedChartName);
+        if (chartConfig) syncDynamicChartDrawerFromConfig(chartConfig);
       }
     }
   } catch (_) {
@@ -1348,6 +1360,44 @@ function syncDynamicChartDrawerDropdown(shapeName) {
   if (!sel || !shapeName) return;
   for (var i = 0; i < sel.options.length; i++) {
     if (sel.options[i].value === shapeName) { sel.selectedIndex = i; break; }
+  }
+}
+
+// Restore all chart drawer dropdowns from a previously saved config.
+function syncDynamicChartDrawerFromConfig(config) {
+  if (!config) return;
+
+  // Title variable
+  var titleSel = document.getElementById('df-chart-title');
+  if (titleSel && config.titleVar) {
+    for (var i = 0; i < titleSel.options.length; i++) {
+      if (titleSel.options[i].value === config.titleVar) { titleSel.selectedIndex = i; break; }
+    }
+  }
+
+  // Table variable — change triggers column dropdown rebuild via onChartTableChanged
+  var tableSel = document.getElementById('df-chart-table');
+  if (tableSel && config.tableVar) {
+    for (var j = 0; j < tableSel.options.length; j++) {
+      if (tableSel.options[j].value === config.tableVar) { tableSel.selectedIndex = j; break; }
+    }
+    onChartTableChanged(); // repopulate label/value columns for this table
+  }
+
+  // Label column
+  var labelSel = document.getElementById('df-chart-label');
+  if (labelSel && config.labelCol) {
+    for (var k = 0; k < labelSel.options.length; k++) {
+      if (labelSel.options[k].value === config.labelCol) { labelSel.selectedIndex = k; break; }
+    }
+  }
+
+  // Value column
+  var valueSel = document.getElementById('df-chart-value');
+  if (valueSel && config.valueCol) {
+    for (var l = 0; l < valueSel.options.length; l++) {
+      if (valueSel.options[l].value === config.valueCol) { valueSel.selectedIndex = l; break; }
+    }
   }
 }
 
@@ -2062,23 +2112,37 @@ async function expandDynamicChartsInXml(zip, xml, slideIndex, configs) {
   return xml; // slide XML is unchanged
 }
 
-// Find the r:id attribute on <c:chart> inside the <p:graphicFrame> named shapeName.
+// Find the r:id attribute on <c:chart> inside a <p:graphicFrame>.
+// First tries to match by shapeName; if that fails, falls back to the first chart
+// in the slide (handles the case where the tag is stored on a companion shape,
+// not the graphicFrame itself — which can happen with placeholder-based charts).
 function findChartRIdInSlideDoc(slideDoc, shapeName, NS_P, NS_C, NS_R) {
   var frames = slideDoc.getElementsByTagNameNS(NS_P, 'graphicFrame');
-  for (var i = 0; i < frames.length; i++) {
-    var frame  = frames[i];
-    var nvPr   = frame.getElementsByTagNameNS(NS_P, 'nvGraphicFramePr')[0];
-    if (!nvPr) continue;
-    var cNvPr  = findChildByLocalName(nvPr, 'cNvPr');
-    if (!cNvPr || cNvPr.getAttribute('name') !== shapeName) continue;
+  var firstChartRId = null; // fallback: first chart rId found anywhere in slide
 
+  for (var i = 0; i < frames.length; i++) {
+    var frame    = frames[i];
     var chartEls = frame.getElementsByTagNameNS(NS_C, 'chart');
     if (!chartEls.length) continue;
-    // r:id is a namespace-qualified attribute in NS_R
+
     var rId = chartEls[0].getAttributeNS(NS_R, 'id') || chartEls[0].getAttribute('r:id');
-    return rId || null;
+    if (!firstChartRId && rId) firstChartRId = rId; // remember first chart
+
+    // Exact match by shape name
+    var nvPr  = frame.getElementsByTagNameNS(NS_P, 'nvGraphicFramePr')[0];
+    if (!nvPr) continue;
+    var cNvPr = findChildByLocalName(nvPr, 'cNvPr');
+    if (cNvPr && cNvPr.getAttribute('name') === shapeName) return rId || null;
   }
-  return null;
+
+  // Fallback: no exact name match — use the first chart found in the slide.
+  // This covers the common case where the tagged shape is a placeholder or
+  // companion textbox rather than the graphicFrame itself.
+  if (firstChartRId) {
+    console.warn('[DynChart] Shape "' + shapeName + '" not found as graphicFrame; ' +
+                 'falling back to first chart in slide (rId=' + firstChartRId + ').');
+  }
+  return firstChartRId;
 }
 
 // Scan rels XML string for the Target of a given relationship Id.

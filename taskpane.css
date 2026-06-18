@@ -431,6 +431,7 @@ html, body {
   transition: border-color 0.15s;
 }
 .field:focus { border-color: #0078d4; background: #fff; }
+.field[readonly] { background: #f0f0f0; color: #888; cursor: default; }
 .textarea { resize: vertical; min-height: 60px; }
 .mono { font-family: "Cascadia Code", "Consolas", monospace; }
 

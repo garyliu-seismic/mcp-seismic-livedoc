@@ -1564,6 +1564,10 @@ async function expandDynamicImagesInXml(zip, xml, slideIndex, configs) {
     var mediaName = 'livedoc_dyn_s' + slideIndex + '_' + (++mediaSeq) + '.' + ext;
     zip.file('ppt/media/' + mediaName, imgData.bytes);
 
+    // Ensure [Content_Types].xml has a Default entry for this extension.
+    // Missing entries cause PowerPoint to prompt "needs repair" on open.
+    await ensureContentType(zip, ext, imgData.mimeType);
+
     // Add relationship entry
     var rId = 'rIdLDDyn' + slideIndex + '_' + mediaSeq;
     var relEl = relsDoc.createElementNS(NS_REL, 'Relationship');
@@ -1719,6 +1723,23 @@ async function fetchImageData(sourceUrl) {
   var mime = (resp.headers.get('content-type') || 'image/png').split(';')[0].trim();
   var ab   = await resp.arrayBuffer();
   return { bytes: new Uint8Array(ab), mimeType: mime };
+}
+
+// Register the image extension in [Content_Types].xml if not already present.
+// Missing entries cause PowerPoint to show "needs repair" when opening the file.
+async function ensureContentType(zip, ext, mimeType) {
+  var ctPath = '[Content_Types].xml';
+  if (!zip.files[ctPath]) return;
+  var ct = await zip.files[ctPath].async('string');
+  if (ct.includes('Extension="' + ext + '"')) return; // already registered
+
+  // Normalise mime type (browsers may return 'image/jpeg' for jpg)
+  var mime = mimeType || ('image/' + ext);
+  if (ext === 'jpg') mime = 'image/jpeg';
+
+  var entry = '<Default Extension="' + ext + '" ContentType="' + mime + '"/>';
+  ct = ct.replace('</Types>', entry + '</Types>');
+  zip.file(ctPath, ct);
 }
 
 // Load image bytes into an <img> element to get natural dimensions.

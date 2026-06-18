@@ -1243,6 +1243,7 @@ async function saveDynamicImageConfig() {
 
       ph.name = shapeName;                        // keep original name so OOXML lookup still works
       ph.fill.setSolidColor('DCE8F8');            // light blue-gray — visually distinct from real content
+      ph.textFrame.autoSizeSetting = PowerPoint.ShapeAutoSize.autoSizeNone; // keep original bounds
       ph.textFrame.textRange.font.size  = 14;
       ph.textFrame.textRange.font.color = '3A5A8A';
       ph.textFrame.textRange.font.bold  = false;

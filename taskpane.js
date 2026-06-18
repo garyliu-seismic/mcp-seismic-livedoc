@@ -2102,8 +2102,11 @@ function resolveRelativePath(baseDir, relTarget) {
   return out.join('/');
 }
 
-// Update the cached data in a chart XML string and return the modified string.
-// Targets: <c:title> text, first <c:ser> <c:strCache> (labels), <c:numCache> (values).
+// Update chart data using literal elements (<c:strLit>/<c:numLit>) instead of cached refs.
+// <c:strRef>/<c:numRef> point to the embedded Excel workbook — PowerPoint loads from there,
+// ignoring the <c:strCache>/<c:numCache> we previously tried to update.
+// Replacing with <c:strLit>/<c:numLit> removes the Excel reference entirely, forcing
+// PowerPoint to use our literal values.
 function updateChartCachedData(chartXml, titleValue, labelValues, numValues) {
   var NS_C = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
   var NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
@@ -2113,39 +2116,68 @@ function updateChartCachedData(chartXml, titleValue, labelValues, numValues) {
 
   var changed = false;
 
-  // 1. Update chart title — find first <a:t> inside <c:title>
-  if (titleValue !== null) {
+  // 1. Update chart title
+  if (titleValue !== null && titleValue !== '') {
     var titleEls = doc.getElementsByTagNameNS(NS_C, 'title');
     if (titleEls.length) {
+      // Handle <c:rich> title (manually typed): update first <a:t>
       var tEls = titleEls[0].getElementsByTagNameNS(NS_A, 't');
       if (tEls.length) {
         tEls[0].textContent = titleValue;
         for (var ti = 1; ti < tEls.length; ti++) tEls[ti].textContent = '';
         changed = true;
+      } else {
+        // Handle <c:strRef> title (linked to cell): update first <c:v> in strCache
+        var strCaches = titleEls[0].getElementsByTagNameNS(NS_C, 'strCache');
+        if (strCaches.length) {
+          var vEls = strCaches[0].getElementsByTagNameNS(NS_C, 'v');
+          if (vEls.length) { vEls[0].textContent = titleValue; changed = true; }
+        }
       }
     }
   }
 
-  // 2. Find the first <c:ser> (handles pie chart with a single series)
+  // 2. Find first <c:ser> (pie chart has exactly one series)
   var serEls = doc.getElementsByTagNameNS(NS_C, 'ser');
-  if (serEls.length) {
-    var ser = serEls[0];
+  if (!serEls.length) {
+    return changed ? new XMLSerializer().serializeToString(doc).replace(/ xmlns=""/g, '') : chartXml;
+  }
+  var ser = serEls[0];
 
-    // 2a. Category labels → <c:cat><c:strRef><c:strCache>
-    if (labelValues && labelValues.length) {
-      var catEl = ser.getElementsByTagNameNS(NS_C, 'cat')[0];
-      if (catEl) {
-        var strCache = catEl.getElementsByTagNameNS(NS_C, 'strCache')[0];
-        if (strCache) { replaceChartCachePoints(doc, strCache, labelValues, NS_C, false); changed = true; }
+  // 2a. Categories: replace <c:strRef> (Excel-linked) with <c:strLit> (literal)
+  //     This ensures PowerPoint uses our values instead of reloading from embedded Excel.
+  if (labelValues && labelValues.length) {
+    var catEl = ser.getElementsByTagNameNS(NS_C, 'cat')[0];
+    if (catEl) {
+      var strLitXml = '<c:strLit xmlns:c="' + NS_C + '">' +
+        '<c:ptCount val="' + labelValues.length + '"/>' +
+        labelValues.map(function (v, i) {
+          return '<c:pt idx="' + i + '"><c:v>' + xmlEscapeVal(String(v)) + '</c:v></c:pt>';
+        }).join('') + '</c:strLit>';
+      var strLitEl = importXmlFragment(doc, strLitXml);
+      if (strLitEl) {
+        while (catEl.firstChild) catEl.removeChild(catEl.firstChild);
+        catEl.appendChild(strLitEl);
+        changed = true;
       }
     }
+  }
 
-    // 2b. Numeric values → <c:val><c:numRef><c:numCache>
-    if (numValues && numValues.length) {
-      var valEl = ser.getElementsByTagNameNS(NS_C, 'val')[0];
-      if (valEl) {
-        var numCache = valEl.getElementsByTagNameNS(NS_C, 'numCache')[0];
-        if (numCache) { replaceChartCachePoints(doc, numCache, numValues, NS_C, true); changed = true; }
+  // 2b. Values: replace <c:numRef> (Excel-linked) with <c:numLit> (literal)
+  if (numValues && numValues.length) {
+    var valEl = ser.getElementsByTagNameNS(NS_C, 'val')[0];
+    if (valEl) {
+      var numLitXml = '<c:numLit xmlns:c="' + NS_C + '">' +
+        '<c:formatCode>General</c:formatCode>' +
+        '<c:ptCount val="' + numValues.length + '"/>' +
+        numValues.map(function (v, i) {
+          return '<c:pt idx="' + i + '"><c:v>' + String(parseFloat(v) || 0) + '</c:v></c:pt>';
+        }).join('') + '</c:numLit>';
+      var numLitEl = importXmlFragment(doc, numLitXml);
+      if (numLitEl) {
+        while (valEl.firstChild) valEl.removeChild(valEl.firstChild);
+        valEl.appendChild(numLitEl);
+        changed = true;
       }
     }
   }
@@ -2154,22 +2186,12 @@ function updateChartCachedData(chartXml, titleValue, labelValues, numValues) {
   return new XMLSerializer().serializeToString(doc).replace(/ xmlns=""/g, '');
 }
 
-// Replace <c:pt> entries inside a cache element (strCache or numCache).
-// Updates <c:ptCount val> and rebuilds <c:pt idx="N"><c:v>value</c:v></c:pt> entries.
-function replaceChartCachePoints(doc, cacheEl, values, NS_C, isNumeric) {
-  Array.from(cacheEl.getElementsByTagNameNS(NS_C, 'pt')).forEach(function (pt) {
-    pt.parentNode.removeChild(pt);
-  });
-  var ptCount = cacheEl.getElementsByTagNameNS(NS_C, 'ptCount')[0];
-  if (ptCount) ptCount.setAttribute('val', String(values.length));
-  values.forEach(function (val, idx) {
-    var pt = doc.createElementNS(NS_C, 'c:pt');
-    pt.setAttribute('idx', String(idx));
-    var v = doc.createElementNS(NS_C, 'c:v');
-    v.textContent = isNumeric ? String(parseFloat(val) || 0) : String(val);
-    pt.appendChild(v);
-    cacheEl.appendChild(pt);
-  });
+// Parse a self-contained XML string and import its root element into targetDoc.
+// Used to create <c:strLit>/<c:numLit> elements without namespace-prefix issues.
+function importXmlFragment(targetDoc, xmlStr) {
+  var fragDoc = new DOMParser().parseFromString(xmlStr, 'application/xml');
+  if (fragDoc.getElementsByTagName('parseerror').length) return null;
+  return targetDoc.importNode(fragDoc.documentElement, true);
 }
 
 // ── Preview — replace tokens and download PPTX ────────────────────────────────

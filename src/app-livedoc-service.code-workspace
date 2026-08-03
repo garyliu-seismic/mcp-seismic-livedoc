@@ -1,0 +1,29 @@
+{
+	"folders": [
+		{
+			"path": "../../app-livedoc-service"
+		},
+		{
+			"path": "../../app-livedoc-construction-engine"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../app-livedoc-core"
+		},
+		{
+			"path": "../../ollama-agent-poc"
+		},
+		{
+			"path": "../../poc-officejs-variables"
+		},
+		{
+			"path": "../../web-liveform-assets"
+		},
+		{
+			"path": "../../monolith-server"
+		}
+	],
+	"settings": {}
+}

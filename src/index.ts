@@ -284,19 +284,34 @@ const tools: Tool[] = [
         manualSelectContentInput: {
           type: "object",
           description:
-            'Slide-group and section-group selection (from get_livedoc_inputs\' ManualSelectContentInput.ManualSelectContentItems, distinguished by contentType "Group" vs "Section"). Everything is included by default - only pass items you want to EXCLUDE, with isInclude: false.',
+            'Content selection (from get_livedoc_inputs\' ManualSelectContentInput.ManualSelectContentItems). Everything is included by default - only pass items you want to EXCLUDE, with isInclude: false, or items that need a resolved versionId (see below). ' +
+            'IMPORTANT: "id" is a stable SLOT identifier from get_livedoc_inputs — always echo it back UNCHANGED, never replace it with a resolved content id. ' +
+            'For contentType "LiveSlide", "ExternalStaticSlides", "ResourcePDF", or "ResourcePDFPage": these slots need a real piece of content assigned. Call search_livedoc_content(query: item.name, contentType: item.contentType) to find it, then set "versionId" to the result\'s contentVersionId (and "sourceBlobId" too if the search result provides a distinct source blob id — needed for ExternalStaticSlides/slide-source references). For "ResourcePDFPage", also set "pageNumber". Do NOT invent a versionId — if search_livedoc_content finds nothing, leave the item out or set isInclude:false rather than fabricating one.',
           properties: {
             manualSelectContentItems: {
               type: "array",
               items: {
                 type: "object",
                 properties: {
-                  id: { type: "string" },
+                  id: { type: "string", description: "Stable slot identifier — copy verbatim from get_livedoc_inputs, never replace." },
                   name: { type: "string" },
                   contentType: {
                     type: "string",
                     description:
                       'One of "Group", "Section", "LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage" - copy from the matching item in get_livedoc_inputs.',
+                  },
+                  versionId: {
+                    type: "string",
+                    description:
+                      "Resolved contentVersionId from search_livedoc_content. Required for LiveSlide/ExternalStaticSlides/ResourcePDF/ResourcePDFPage items being included — never fabricate this value.",
+                  },
+                  sourceBlobId: {
+                    type: "string",
+                    description: "Resolved source blob id, when the search result provides one distinct from versionId (e.g. ExternalStaticSlides).",
+                  },
+                  pageNumber: {
+                    type: "number",
+                    description: "Page number within the resource, for contentType ResourcePDFPage only.",
                   },
                   isInclude: { type: "boolean", description: "Set false to exclude this item. Defaults to true." },
                   orderIndex: { type: "number" },
@@ -968,6 +983,10 @@ async function handleSearchContent(args: {
   };
 }
 
+// contentType values whose content must be resolved via search_livedoc_content — these
+// need a real "versionId" filled in before submission, never a fabricated one.
+const CONTENT_TYPES_REQUIRING_VERSION_ID = new Set(["LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage"]);
+
 async function handleGetInputs(args: {
   teamSiteId: string;
   libraryContentVersionId: string;
@@ -1027,11 +1046,29 @@ async function handleSubmitGeneration(args: {
       id: string;
       name?: string;
       contentType: string;
+      versionId?: string;
+      sourceBlobId?: string;
+      pageNumber?: number;
       isInclude: boolean;
       orderIndex?: number;
     }>;
   };
 }) {
+  if (args.manualSelectContentInput) {
+    const unresolved = args.manualSelectContentInput.manualSelectContentItems.filter(
+      (item) =>
+        item.isInclude !== false &&
+        CONTENT_TYPES_REQUIRING_VERSION_ID.has(item.contentType) &&
+        !item.versionId
+    );
+    if (unresolved.length > 0) {
+      return {
+        error: "manualSelectContentInput has items missing a resolved versionId.",
+        detail: `Item(s) [${unresolved.map((i) => `"${i.name ?? i.id}"`).join(", ")}] have contentType requiring real content but no versionId. Call search_livedoc_content(query: <item name>, contentType: <item contentType>) first, then set versionId to the result's contentVersionId — never fabricate one. If no match, set isInclude:false instead.`,
+      };
+    }
+  }
+
   const reqBody: Record<string, unknown> = {
     adHocInputs: args.adHocInputs,
     outputs: args.outputs,
@@ -1044,6 +1081,9 @@ async function handleSubmitGeneration(args: {
         id: item.id,
         name: item.name,
         contentType: item.contentType,
+        versionId: item.versionId,
+        sourceBlobId: item.sourceBlobId,
+        pageNumber: item.pageNumber,
         isInclude: item.isInclude,
         orderIndex: item.orderIndex,
       })),
@@ -1376,7 +1416,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 `- Variable list sections: same grid+table pattern with a section heading`,
                 `- Manual select groups (manualSelectContentInput.manualSelectContentItems):`,
                 `  - contentType "Group" or "Section": render as checkbox, checked by default (isInclude:true). Unchecked → isInclude:false. Include ALL items in payload.`,
-                `  - contentType "ExternalSlides", "LiveSlide", "ExternalStaticSlides", "LiveDoc", "PDF" (external content): these are PLACEHOLDER items — the id is NOT valid. For each, call search_livedoc_content(query=item.name, contentType=item.contentType) BEFORE rendering the form. Render results as a search picker (text input + selectable list). The user must pick the real document. In the payload use: id=selected contentVersionId, isInclude=true, and contentType mapped by selected format: LiveDoc→"LiveSlide", PPTX→"LiveSlide", PDF→"ResourcePDF". IMPORTANT: never use "ExternalSlides" as the contentType in the submission payload — it is only a template placeholder value returned by get_livedoc_inputs and is not accepted by submit_livedoc_generation.`,
+                `  - contentType "LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage" (external content): these slots need a real document assigned. For each, call search_livedoc_content(query=item.name, contentType=item.contentType) BEFORE rendering the form. Render results as a search picker (text input + selectable list). The user must pick the real document. In the payload: keep "id" UNCHANGED from get_livedoc_inputs (it's a stable slot identifier, not a content id — never replace it), set "versionId" to the selected result's contentVersionId, set "sourceBlobId" too if the result provides a distinct source blob id, isInclude=true. Never fabricate a versionId — if search finds nothing, set isInclude:false instead.`,
                 `- Form selector: pill buttons for each unique form name — only show when there are 2+ distinct names`,
                 `- Output format: single-select pill buttons showing format codes joined by " + " (e.g. "PDF", "PPTX + PDF") — one button per forms[] entry`,
                 `- Submit button: collect all field values into the JSON payload shape below and send it as a user message so I can call submit_livedoc_generation`,
@@ -1386,11 +1426,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 `  "teamSiteId": "${ir.teamSiteId}",`,
                 `  "libraryContentVersionId": "${ir.libraryContentVersionId}",`,
                 `  "adHocInputs": [{ "name": "...", "value": ... }],`,
-                `  "outputs": [{ "format": "PDF" }],`,
+                `  "outputs": [{ "format": "PDF", "fileName": "<templateName>.pdf" }],`,
                 `  "variableListData": [{ "variableListName": "...", "variableInputs": [{ "name": "...", "value": ... }] }],`,
-                `  "manualSelectContentInput": { "manualSelectContentItems": [{ "id": "...", "name": "...", "contentType": "...", "isInclude": true/false, "orderIndex": N }] }`,
+                `  "manualSelectContentInput": { "manualSelectContentItems": [{ "id": "...", "name": "...", "contentType": "...", "versionId": "<from search_livedoc_content, only for LiveSlide/ExternalStaticSlides/ResourcePDF/ResourcePDFPage>", "isInclude": true/false, "orderIndex": N }] }`,
                 `}`,
-                `NOTE: manualSelectContentInput — include ALL items always; only isInclude changes (true=selected, false=deselected). Omit the key entirely if the template has no manualSelectContentInput.`,
+                `NOTE: manualSelectContentInput — include ALL items always; only isInclude changes (true=selected, false=deselected). "id" is always echoed unchanged. Omit the key entirely if the template has no manualSelectContentInput. NOTE: outputs[].fileName is required — derive it from the template name, e.g. "${ir.templateName}.pdf".`,
                 ``,
                 `TEMPLATE DATA:`,
                 JSON.stringify({

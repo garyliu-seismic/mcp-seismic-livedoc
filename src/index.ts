@@ -1562,11 +1562,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ir.libraryContentVersionId,
           formToken
         );
+        const msItemsForCheck = (ir.manualSelectContentInput?.manualSelectContentItems as Array<Record<string, unknown>> | undefined) ?? [];
+        const hasExternalContent = msItemsForCheck.some((i) => "candidates" in i);
+        const recommendation = hasExternalContent
+          ? `NOTE: this template has external content selection (documents to pick from a search). The inline artifact below supports it, but that requires this chat's HTML-artifact tool to render correctly and a submission within a 10-minute window — consider calling open_form_ui instead for a more reliable browser-tab experience with no such time limit, especially if the user wants to browse many candidates.\n\n`
+          : "";
         return {
           content: [
             {
               type: "text" as const,
               text: [
+                recommendation +
                 `Create an HTML artifact using EXACTLY the HTML below, verbatim, with no modifications — it already has a working, tested submit mechanism wired to this MCP server. Do NOT hand-write your own form HTML for this.`,
                 `Immediately after creating the artifact, call wait_for_form_submit with token="${formToken}" — do not wait for the user to say anything first. That call blocks (up to 10 minutes) until the user clicks the form's submit button, then returns the exact payload to pass to submit_livedoc_generation.`,
                 ``,

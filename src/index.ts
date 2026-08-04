@@ -667,21 +667,43 @@ function buildFormHtml(
     return `<div class="section"><div class="sl">Variable list — ${esc(vlName)}${dsSpan}</div>${scGrid}${tblParts}</div>`;
   }).join("");
 
-  // Manual select groups
+  // Manual select groups/sections (plain include/exclude) and external content (needs a
+  // resolved candidate picked from a dropdown — candidates are pre-attached by handleGetInputs).
   let msHtml = "";
   if (manualSelect) {
     const items = (gf(manualSelect, "manualSelectContentItems") as Array<Record<string, unknown>>) ?? [];
-    const groups = items.filter(i => String(gf(i, "contentType") ?? "") === "Group");
-    if (groups.length) {
-      const checks = groups.map(g => {
-        const gId = esc(String(gf(g, "id") ?? ""));
-        const gName = esc(String(gf(g, "name") ?? ""));
-        const inc = gf(g, "isInclude") !== false ? " checked" : "";
-        const oi = Number(gf(g, "orderIndex") ?? 0);
-        return `<label class="grp"><input type="checkbox"${inc} data-group-id="${gId}" data-group-name="${gName}" data-order-index="${oi}" data-content-type="Group"> <span>${gName}</span></label>`;
-      }).join("");
-      msHtml = `<div class="section"><div class="sl">Content selection</div><div class="grp-list">${checks}</div></div>`;
-    }
+    const groups = items.filter(i => ["Group", "Section"].includes(String(gf(i, "contentType") ?? "")));
+    const external = items.filter(i => !["Group", "Section"].includes(String(gf(i, "contentType") ?? "")));
+
+    const checks = groups.map(g => {
+      const gId = esc(String(gf(g, "id") ?? ""));
+      const gName = esc(String(gf(g, "name") ?? ""));
+      const gType = esc(String(gf(g, "contentType") ?? "Group"));
+      const inc = gf(g, "isInclude") !== false ? " checked" : "";
+      const oi = Number(gf(g, "orderIndex") ?? 0);
+      return `<label class="grp"><input type="checkbox"${inc} data-group-id="${gId}" data-group-name="${gName}" data-order-index="${oi}" data-content-type="${gType}"> <span>${gName}</span></label>`;
+    }).join("");
+    const groupsHtml = groups.length
+      ? `<div class="section"><div class="sl">Content selection</div><div class="grp-list">${checks}</div></div>`
+      : "";
+
+    const externalHtml = external.map(item => {
+      const iId = esc(String(gf(item, "id") ?? ""));
+      const iName = esc(String(gf(item, "name") ?? ""));
+      const oi = Number(gf(item, "orderIndex") ?? 0);
+      const candidates = (gf(item, "candidates") as Array<Record<string, unknown>> | undefined) ?? [];
+      const inc = gf(item, "isInclude") !== false ? " checked" : "";
+      const selId = "ext-sel-" + iId.replace(/[^a-zA-Z0-9]/g, "_");
+      if (!candidates.length) {
+        return `<div class="ext-item"><label class="grp"><input type="checkbox" disabled data-external-id="${iId}" data-external-name="${iName}" data-order-index="${oi}"> <span>${iName}</span> <span class="badge" style="background:#fde8e8;color:#c00">No matching content found</span></label></div>`;
+      }
+      const options = candidates.map(c =>
+        `<option value='${esc(JSON.stringify({ versionId: gf(c, "versionId"), sourceBlobId: gf(c, "sourceBlobId"), format: gf(c, "format") }))}'>${esc(String(gf(c, "title") ?? ""))} (${esc(String(gf(c, "format") ?? ""))})</option>`
+      ).join("");
+      return `<div class="ext-item"><label class="grp"><input type="checkbox"${inc} data-external-id="${iId}" data-external-name="${iName}" data-order-index="${oi}"> <span>${iName}</span></label><label class="fl" style="display:block;margin:6px 0 4px">Select content:</label><select class="fi" data-external-select="${iId}">${options}</select></div>`;
+    }).join("");
+
+    msHtml = groupsHtml + (externalHtml ? `<div class="section"><div class="sl">External content</div>${externalHtml}</div>` : "");
   }
 
   // Group forms by unique name → { formName: [{outputs}, ...] }
@@ -754,7 +776,8 @@ body{background:#fff;padding:20px;font-size:14px;color:#1d1d1f}
 .sub:hover{background:#0055b3}
 .grp-list{display:flex;flex-direction:column;gap:8px}
 .grp{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px}
-.grp input{width:16px;height:16px}`;
+.grp input{width:16px;height:16px}
+.ext-item{margin-bottom:14px;padding:10px 12px;border:1px solid #e5e5e5;border-radius:8px}`;
 
   const js = `var sel=${initOutputs};
 var tsid=${JSON.stringify(teamSiteId)};
@@ -834,6 +857,20 @@ function submit(){
   var vld=Object.keys(vlmap).map(function(k){return{variableListName:k,variableInputs:vlmap[k]};});
   var ms=[];
   document.querySelectorAll('[data-group-id]').forEach(function(cb){ms.push({id:cb.dataset.groupId,name:cb.dataset.groupName,contentType:cb.dataset.contentType||'Group',isInclude:cb.checked,orderIndex:parseInt(cb.dataset.orderIndex)||0});});
+  document.querySelectorAll('[data-external-id]').forEach(function(cb){
+    var item={id:cb.dataset.externalId,name:cb.dataset.externalName,isInclude:cb.checked,orderIndex:parseInt(cb.dataset.orderIndex)||0};
+    var sel=document.querySelector('[data-external-select="'+cb.dataset.externalId+'"]');
+    if(sel&&sel.value){
+      var chosen=JSON.parse(sel.value);
+      item.versionId=chosen.versionId;
+      if(chosen.sourceBlobId)item.sourceBlobId=chosen.sourceBlobId;
+      item.contentType=(chosen.format||'').toUpperCase()==='PDF'?'ResourcePDF':'LiveSlide';
+    }else{
+      item.contentType='LiveSlide';
+      item.isInclude=false;
+    }
+    ms.push(item);
+  });
   var p={teamSiteId:tsid,libraryContentVersionId:vid,adHocInputs:adhoc,outputs:sel};
   if(vld.length)p.variableListData=vld;
   if(ms.length)p.manualSelectContentInput={manualSelectContentItems:ms};
@@ -1489,48 +1526,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             content: [{ type: "text" as const, text: "This template requires image uploads. Use open_form_ui to open the full form in a browser tab." }],
           };
         }
-        const complexHint = ir.isComplex
-          ? " (complex template — also offer open_form_ui as a browser-tab alternative)"
-          : "";
+        if (ir.isComplex) {
+          return {
+            content: [{ type: "text" as const, text: "This is a complex template. Use open_form_ui to open the full form in a browser tab instead of building an inline artifact." }],
+          };
+        }
+        const formToken = generateToken();
+        const formHtml = buildFormHtml(
+          ir.templateName,
+          ir.adhocInputs,
+          ir.variableListData,
+          ir.manualSelectContentInput,
+          ir.forms,
+          ir.teamSiteId,
+          ir.libraryContentVersionId,
+          formToken
+        );
         return {
           content: [
             {
               type: "text" as const,
               text: [
-                `Create an HTML artifact — an input form for the LiveDoc template below${complexHint}.`,
+                `Create an HTML artifact using EXACTLY the HTML below, verbatim, with no modifications — it already has a working, tested submit mechanism wired to this MCP server. Do NOT hand-write your own form HTML for this.`,
+                `Immediately after creating the artifact, call wait_for_form_submit with token="${formToken}" — do not wait for the user to say anything first. That call blocks (up to 10 minutes) until the user clicks the form's submit button, then returns the exact payload to pass to submit_livedoc_generation.`,
                 ``,
-                `LAYOUT RULES (follow exactly):`,
-                `- Scalar ad-hoc inputs: 4-column CSS grid (display:grid; grid-template-columns:repeat(4,1fr); gap:12px 16px)`,
-                `- TABLE-type inputs (has "columns" array): full-width table widget with "+ Add row" button and per-row delete button`,
-                `- Variable list sections: same grid+table pattern with a section heading`,
-                `- Manual select groups (manualSelectContentInput.manualSelectContentItems):`,
-                `  - contentType "Group" or "Section": render as checkbox, checked by default (isInclude:true). Unchecked → isInclude:false. Include ALL items in payload.`,
-                `  - ANY OTHER contentType (e.g. "ExternalSlides", "LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage" — the GET vocabulary here doesn't match the submission enum 1:1): these items already have a "candidates" array attached (pre-resolved server-side using the item's own filter — you do NOT need to call search_livedoc_content yourself for these). Render "candidates" as a real dropdown/<select> or radio list of actual document titles — NOT a plain include/exclude checkbox, and NOT a live "Search" input (the artifact is static HTML in a sandboxed iframe and cannot call tools at runtime, so a search box would silently do nothing). If "candidates" is empty, show "No matching content found" and disable inclusion for that item — do not fabricate an option. In the payload: keep "id" UNCHANGED (it's a stable slot identifier, not a content id — never replace it), set "versionId"/"sourceBlobId" from the chosen candidate, isInclude=true, and set "contentType" to a value the submission API actually accepts based on the chosen candidate's format — "PDF" format → "ResourcePDF", any PPTX/slide format → "LiveSlide" (never resubmit "ExternalSlides" verbatim — it is not a valid submission contentType).`,
-                `- Form selector: pill buttons for each unique form name — only show when there are 2+ distinct names`,
-                `- Output format: single-select pill buttons showing format codes joined by " + " (e.g. "PDF", "PPTX + PDF") — one button per forms[] entry`,
-                `- Submit button: collect all field values into the JSON payload shape below and send it as a user message so I can call submit_livedoc_generation`,
-                ``,
-                `PAYLOAD SHAPE the submit must produce:`,
-                `{`,
-                `  "teamSiteId": "${ir.teamSiteId}",`,
-                `  "libraryContentVersionId": "${ir.libraryContentVersionId}",`,
-                `  "adHocInputs": [{ "name": "...", "value": ... }],`,
-                `  "outputs": [{ "format": "PDF", "fileName": "<templateName>.pdf" }],`,
-                `  "variableListData": [{ "variableListName": "...", "variableInputs": [{ "name": "...", "value": ... }] }],`,
-                `  "manualSelectContentInput": { "manualSelectContentItems": [{ "id": "...", "name": "...", "contentType": "...", "versionId": "<from search_livedoc_content, only for LiveSlide/ExternalStaticSlides/ResourcePDF/ResourcePDFPage>", "isInclude": true/false, "orderIndex": N }] }`,
-                `}`,
-                `NOTE: manualSelectContentInput — include ALL items always; only isInclude changes (true=selected, false=deselected). "id" is always echoed unchanged. Omit the key entirely if the template has no manualSelectContentInput. NOTE: outputs[].fileName is required — derive it from the template name, e.g. "${ir.templateName}.pdf".`,
-                ``,
-                `TEMPLATE DATA:`,
-                JSON.stringify({
-                  templateName: ir.templateName,
-                  teamSiteId: ir.teamSiteId,
-                  libraryContentVersionId: ir.libraryContentVersionId,
-                  adhocInputs: ir.adhocInputs,
-                  variableListData: ir.variableListData,
-                  manualSelectContentInput: ir.manualSelectContentInput,
-                  forms: ir.forms,
-                }, null, 2),
+                "```html",
+                formHtml,
+                "```",
               ].join("\n"),
             },
           ],

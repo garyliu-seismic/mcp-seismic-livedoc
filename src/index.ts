@@ -1562,24 +1562,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ir.libraryContentVersionId,
           formToken
         );
-        const msItemsForCheck = (ir.manualSelectContentInput?.manualSelectContentItems as Array<Record<string, unknown>> | undefined) ?? [];
-        const hasExternalContent = msItemsForCheck.some((i) => "candidates" in i);
-        const recommendation = hasExternalContent
-          ? `DEFAULT TO open_form_ui for this template instead of the inline artifact below — it has external content selection, and the in-chat artifact-creation tool has repeatedly failed or been unreliable for this case in practice (silent tool errors, 10-minute wait_for_form_submit timeouts with nothing rendered). Only build the inline artifact if the user explicitly asks for an in-chat form specifically (e.g. "show it here in chat", not just "show me a form" or "let me fill it in").\n\n`
-          : "";
+
+        // Write the pre-built HTML straight to disk and open it in the browser, rather than
+        // relaying a 13-16KB HTML+JS blob through create_artifact — that relay is what a model
+        // has to reproduce verbatim as a tool-call argument, and it has repeatedly corrupted or
+        // failed outright (same failure class as long JWTs corrupting through chat relay). A
+        // file path is a few dozen characters; there's nothing left for the model to get wrong.
+        const safeName = ir.templateName.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || "livedoc-form";
+        const formFilePath = uniqueFilePath(getDownloadsDir(), `${safeName} (${formToken}).html`);
+        fs.writeFileSync(formFilePath, formHtml);
+        openWithDefaultApp(formFilePath);
+
         return {
           content: [
             {
               type: "text" as const,
               text: [
-                recommendation +
-                `Create an HTML artifact using EXACTLY the HTML below, verbatim, with no modifications — it already has a working, tested submit mechanism wired to this MCP server. Do NOT hand-write your own form HTML for this.`,
-                `IMPORTANT: if the artifact-creation tool call errors, returns a validation failure, or you're unsure it actually succeeded — STOP. Do NOT proceed to call wait_for_form_submit anyway and do NOT describe the form as ready. A wait_for_form_submit call with no real rendered form blocks for up to 10 minutes accomplishing nothing, since the user has nothing to click. Instead, report the exact error to the user and suggest calling open_form_ui instead (a browser tab, not an artifact — avoids this failure mode entirely) or retrying.`,
-                `Only after the artifact is confirmed created successfully: immediately call wait_for_form_submit with token="${formToken}" — do not wait for the user to say anything first. That call blocks (up to 10 minutes) until the user clicks the form's submit button, then returns the exact payload to pass to submit_livedoc_generation.`,
-                ``,
-                "```html",
-                formHtml,
-                "```",
+                `The input form for "${ir.templateName}" has been opened in the browser: ${formFilePath}`,
+                `Tell the user to fill it out and click Submit there. Immediately call wait_for_form_submit with token="${formToken}" now — do not wait for the user to say anything first. That call blocks (up to 10 minutes) until the form is submitted, then returns the exact payload to pass to submit_livedoc_generation.`,
+                `Do NOT build an in-chat HTML artifact for this — the file just opened already has a working, tested submit mechanism wired to this MCP server.`,
               ].join("\n"),
             },
           ],

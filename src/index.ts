@@ -1565,7 +1565,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const msItemsForCheck = (ir.manualSelectContentInput?.manualSelectContentItems as Array<Record<string, unknown>> | undefined) ?? [];
         const hasExternalContent = msItemsForCheck.some((i) => "candidates" in i);
         const recommendation = hasExternalContent
-          ? `NOTE: this template has external content selection (documents to pick from a search). The inline artifact below supports it, but that requires this chat's HTML-artifact tool to render correctly and a submission within a 10-minute window — consider calling open_form_ui instead for a more reliable browser-tab experience with no such time limit, especially if the user wants to browse many candidates.\n\n`
+          ? `DEFAULT TO open_form_ui for this template instead of the inline artifact below — it has external content selection, and the in-chat artifact-creation tool has repeatedly failed or been unreliable for this case in practice (silent tool errors, 10-minute wait_for_form_submit timeouts with nothing rendered). Only build the inline artifact if the user explicitly asks for an in-chat form specifically (e.g. "show it here in chat", not just "show me a form" or "let me fill it in").\n\n`
           : "";
         return {
           content: [

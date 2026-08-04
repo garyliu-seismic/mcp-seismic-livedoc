@@ -991,9 +991,15 @@ async function handleSearchContent(args: {
   };
 }
 
-// contentType values whose content must be resolved via search_livedoc_content — these
-// need a real "versionId" filled in before submission, never a fabricated one.
-const CONTENT_TYPES_REQUIRING_VERSION_ID = new Set(["LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage"]);
+// "Group"/"Section" are the only manualSelectContentItem types that are already fully valid
+// as returned — every other contentType needs real content resolved via search before submission.
+// This is a denylist rather than an allowlist because the GET side's vocabulary doesn't match
+// the submission-side ManualSelectContentType enum 1:1 (e.g. GET can return "ExternalSlides",
+// which isn't even a valid value to submit — it must be resolved then re-mapped to "LiveSlide"
+// or "ResourcePDF" depending on the chosen candidate's format).
+function needsContentResolution(contentType: string): boolean {
+  return contentType !== "" && contentType !== "Group" && contentType !== "Section";
+}
 
 // C# bool property names here don't follow simple camelCase (AllowPDF, IncludeStandardPPTX),
 // so check several literal casings rather than relying on gf()'s single-fallback capitalization.
@@ -1012,7 +1018,8 @@ async function resolveManualSelectCandidates(item: Record<string, unknown>): Pro
   const name = String(gf(item, "name") ?? "");
   const contentType = String(gf(item, "contentType") ?? "");
   const filter = (gf(item, "filter") as unknown[] | undefined) ?? [];
-  const isApplyAllFilter = typeof item.isApplyAllFilter === "boolean" ? item.isApplyAllFilter : true;
+  const rawIsApplyAllFilter = gf(item, "isApplyAllFilter");
+  const isApplyAllFilter = typeof rawIsApplyAllFilter === "boolean" ? rawIsApplyAllFilter : true;
 
   let allowPptx = boolField(item, "allowPptx", "AllowPptx");
   let includeStandardPptx = boolField(item, "includeStandardPptx", "IncludeStandardPPTX", "IncludeStandardPptx");
@@ -1029,7 +1036,6 @@ async function resolveManualSelectCandidates(item: Record<string, unknown>): Pro
   }
 
   const body: Record<string, unknown> = {
-    searchText: name,
     allowPptx,
     includeStandardPptx,
     includeLiveDoc,
@@ -1038,8 +1044,13 @@ async function resolveManualSelectCandidates(item: Record<string, unknown>): Pro
     orderBy: [{ attr: "modifiedDate", direction: "DESC" }],
   };
   if (filter.length > 0) {
+    // The item's own filter is the template author's actual search criteria — combining it
+    // with a searchText:name guess (name is just a display label, e.g. "sp3") over-constrains
+    // the query and silently returns zero results, so filter and searchText are mutually exclusive here.
     body.filter = filter;
     body.isApplyAllFilter = isApplyAllFilter;
+  } else {
+    body.searchText = name;
   }
 
   const result = await apiFetch("/v3/contents", { method: "POST", body: JSON.stringify(body) });
@@ -1090,7 +1101,7 @@ async function handleGetInputs(args: {
   await Promise.all(
     msItems.map(async (item) => {
       const contentType = String(gf(item, "contentType") ?? "");
-      if (!CONTENT_TYPES_REQUIRING_VERSION_ID.has(contentType)) return;
+      if (!needsContentResolution(contentType)) return;
       item.candidates = await resolveManualSelectCandidates(item);
     })
   );
@@ -1136,13 +1147,13 @@ async function handleSubmitGeneration(args: {
     const unresolved = args.manualSelectContentInput.manualSelectContentItems.filter(
       (item) =>
         item.isInclude !== false &&
-        CONTENT_TYPES_REQUIRING_VERSION_ID.has(item.contentType) &&
+        needsContentResolution(item.contentType) &&
         !item.versionId
     );
     if (unresolved.length > 0) {
       return {
         error: "manualSelectContentInput has items missing a resolved versionId.",
-        detail: `Item(s) [${unresolved.map((i) => `"${i.name ?? i.id}"`).join(", ")}] have contentType requiring real content but no versionId. Call search_livedoc_content(query: <item name>, contentType: <item contentType>) first, then set versionId to the result's contentVersionId — never fabricate one. If no match, set isInclude:false instead.`,
+        detail: `Item(s) [${unresolved.map((i) => `"${i.name ?? i.id}"`).join(", ")}] have contentType requiring real content but no versionId. Call get_livedoc_inputs again and use the resolved "candidates" it attaches to this item, or call search_livedoc_content(query: <item name>, contentType: <item contentType>) directly, then set versionId to the result's contentVersionId — never fabricate one. If no match, set isInclude:false instead.`,
       };
     }
   }
@@ -1494,7 +1505,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 `- Variable list sections: same grid+table pattern with a section heading`,
                 `- Manual select groups (manualSelectContentInput.manualSelectContentItems):`,
                 `  - contentType "Group" or "Section": render as checkbox, checked by default (isInclude:true). Unchecked → isInclude:false. Include ALL items in payload.`,
-                `  - contentType "LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage" (external content): these items already have a "candidates" array attached (pre-resolved server-side via search_livedoc_content — you do NOT need to call that tool yourself for these). Render "candidates" as a real dropdown/<select> or radio list of actual document titles — NOT a plain include/exclude checkbox, and NOT a live "Search" input (the artifact is static HTML in a sandboxed iframe and cannot call tools at runtime, so a search box would silently do nothing). If "candidates" is empty, show "No matching content found" and disable inclusion for that item — do not fabricate an option. In the payload: keep "id" UNCHANGED (it's a stable slot identifier, not a content id — never replace it), set "versionId"/"sourceBlobId" from the chosen candidate, isInclude=true.`,
+                `  - ANY OTHER contentType (e.g. "ExternalSlides", "LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage" — the GET vocabulary here doesn't match the submission enum 1:1): these items already have a "candidates" array attached (pre-resolved server-side using the item's own filter — you do NOT need to call search_livedoc_content yourself for these). Render "candidates" as a real dropdown/<select> or radio list of actual document titles — NOT a plain include/exclude checkbox, and NOT a live "Search" input (the artifact is static HTML in a sandboxed iframe and cannot call tools at runtime, so a search box would silently do nothing). If "candidates" is empty, show "No matching content found" and disable inclusion for that item — do not fabricate an option. In the payload: keep "id" UNCHANGED (it's a stable slot identifier, not a content id — never replace it), set "versionId"/"sourceBlobId" from the chosen candidate, isInclude=true, and set "contentType" to a value the submission API actually accepts based on the chosen candidate's format — "PDF" format → "ResourcePDF", any PPTX/slide format → "LiveSlide" (never resubmit "ExternalSlides" verbatim — it is not a valid submission contentType).`,
                 `- Form selector: pill buttons for each unique form name — only show when there are 2+ distinct names`,
                 `- Output format: single-select pill buttons showing format codes joined by " + " (e.g. "PDF", "PPTX + PDF") — one button per forms[] entry`,
                 `- Submit button: collect all field values into the JSON payload shape below and send it as a user message so I can call submit_livedoc_generation`,

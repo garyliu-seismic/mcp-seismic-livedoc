@@ -489,6 +489,14 @@ const tools: Tool[] = [
       required: ["generatedLivedocId", "outputId"],
     },
   },
+  {
+    name: "debug_environment",
+    description:
+      "Diagnostic tool: dumps this MCP server process's working directory, the NAMES of environment variables whose name contains a few keywords " +
+      "(claude, anthropic, output, sandbox, session, cowork, agent, workspace), and the VALUES of only those among them that look like filesystem paths (secrets/tokens are never included). " +
+      "Use this to check whether Claude Desktop/Cowork passes a sandboxed output-folder path to spawned MCP servers via an env var.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
 
   // ── PPTX Auto-Tagging tools (PoC) ─────────────────────────────────────────
   {
@@ -1631,6 +1639,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "download_generation_output":
         result = await handleDownloadGenerationOutput(args as { generatedLivedocId: string; outputId: string; autoOpen?: boolean });
         break;
+      case "debug_environment": {
+        const keywords = /claude|anthropic|output|sandbox|session|cowork|agent|workspace/i;
+        const looksLikePath = (v: string) => /^[a-zA-Z]:[\\/]|^\//.test(v) && /[\\/]/.test(v);
+        const matchedVarNames = Object.keys(process.env).filter((k) => keywords.test(k));
+        // Only surface values that look like filesystem paths — the goal is finding a sandbox
+        // output directory, not incidentally leaking a token/secret whose name matches a keyword.
+        const pathLikeValues = Object.fromEntries(
+          matchedVarNames
+            .map((k) => [k, process.env[k] ?? ""])
+            .filter(([, v]) => looksLikePath(v as string))
+        );
+        result = {
+          cwd: process.cwd(),
+          matchedEnvVarNames: matchedVarNames,
+          pathLikeEnvVarValues: pathLikeValues,
+        };
+        break;
+      }
       // ── PPTX Auto-Tagging (PoC) ─────────────────────────────────────────────
       case "pptx_extract_shapes": {
         const a = (args ?? {}) as { pptxBase64: string; slideIndex?: number };

@@ -149,7 +149,8 @@ const tools: Tool[] = [
   {
     name: "search_livedoc_templates",
     description:
-      "Search for LiveDoc (Document Generator) templates in Seismic by name or keyword. Returns contentVersionId and teamSiteId needed for other tools.",
+      "Search for LiveDoc (Document Generator) templates in Seismic by name or keyword. Returns contentVersionId and teamSiteId needed for other tools. " +
+      "ALWAYS call this FIRST whenever the user names or describes a template (e.g. \"generate ContentSelectorForm\") — do NOT ask the user for teamSiteId/libraryContentVersionId directly; those are internal ids the user is unlikely to know. Only ask the user to disambiguate if this search returns zero or multiple plausible matches.",
     inputSchema: {
       type: "object",
       properties: {

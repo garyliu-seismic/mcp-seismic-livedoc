@@ -667,8 +667,8 @@ function buildFormHtml(
     return `<div class="section"><div class="sl">Variable list — ${esc(vlName)}${dsSpan}</div>${scGrid}${tblParts}</div>`;
   }).join("");
 
-  // Manual select groups/sections (plain include/exclude) and external content (needs a
-  // resolved candidate picked from a dropdown — candidates are pre-attached by handleGetInputs).
+  // Manual select groups/sections (plain include/exclude) and external content (one or more
+  // resolved candidates picked via checkboxes — candidates are pre-attached by handleGetInputs).
   let msHtml = "";
   if (manualSelect) {
     const items = (gf(manualSelect, "manualSelectContentItems") as Array<Record<string, unknown>>) ?? [];
@@ -692,15 +692,23 @@ function buildFormHtml(
       const iName = esc(String(gf(item, "name") ?? ""));
       const oi = Number(gf(item, "orderIndex") ?? 0);
       const candidates = (gf(item, "candidates") as Array<Record<string, unknown>> | undefined) ?? [];
-      const inc = gf(item, "isInclude") !== false ? " checked" : "";
-      const selId = "ext-sel-" + iId.replace(/[^a-zA-Z0-9]/g, "_");
       if (!candidates.length) {
-        return `<div class="ext-item"><label class="grp"><input type="checkbox" disabled data-external-id="${iId}" data-external-name="${iName}" data-order-index="${oi}"> <span>${iName}</span> <span class="badge" style="background:#fde8e8;color:#c00">No matching content found</span></label></div>`;
+        return `<div class="ext-item"><div class="sl" style="margin-bottom:6px">${iName}</div><span class="badge" style="background:#fde8e8;color:#c00">No matching content found</span></div>`;
       }
-      const options = candidates.map(c =>
-        `<option value='${esc(JSON.stringify({ versionId: gf(c, "versionId"), sourceBlobId: gf(c, "sourceBlobId"), format: gf(c, "format") }))}'>${esc(String(gf(c, "title") ?? ""))} (${esc(String(gf(c, "format") ?? ""))})</option>`
-      ).join("");
-      return `<div class="ext-item"><label class="grp"><input type="checkbox"${inc} data-external-id="${iId}" data-external-name="${iName}" data-order-index="${oi}"> <span>${iName}</span></label><label class="fl" style="display:block;margin:6px 0 4px">Select content:</label><select class="fi" data-external-select="${iId}">${options}</select></div>`;
+      const totalCount = Number(gf(item, "candidatesTotalCount") ?? candidates.length);
+      const truncatedNote = totalCount > candidates.length
+        ? ` <span class="badge">Showing ${candidates.length} of ${totalCount} matches — refine the template's content filter if you need a different one</span>`
+        : "";
+      // Multiple documents can be attached to the same slot, so each candidate is its own
+      // checkbox rather than a single-select dropdown — checking N boxes submits N items
+      // that all share this slot's id/name but carry different resolved versionId/format.
+      const candidateChecks = candidates.map((c, i) => {
+        const val = esc(JSON.stringify({ versionId: gf(c, "versionId"), sourceBlobId: gf(c, "sourceBlobId"), format: gf(c, "format") }));
+        const label = esc(`${String(gf(c, "title") ?? "")} (${String(gf(c, "format") ?? "")})`);
+        const checkedAttr = i === 0 ? " checked" : "";
+        return `<label class="grp"><input type="checkbox"${checkedAttr} data-external-candidate="${iId}" data-external-name="${iName}" data-order-index="${oi}" value='${val}'> <span>${label}</span></label>`;
+      }).join("");
+      return `<div class="ext-item"><div class="sl" style="margin-bottom:6px">${iName}${truncatedNote}</div><div class="grp-list">${candidateChecks}</div></div>`;
     }).join("");
 
     msHtml = groupsHtml + (externalHtml ? `<div class="section"><div class="sl">External content</div>${externalHtml}</div>` : "");
@@ -857,19 +865,26 @@ function submit(){
   var vld=Object.keys(vlmap).map(function(k){return{variableListName:k,variableInputs:vlmap[k]};});
   var ms=[];
   document.querySelectorAll('[data-group-id]').forEach(function(cb){ms.push({id:cb.dataset.groupId,name:cb.dataset.groupName,contentType:cb.dataset.contentType||'Group',isInclude:cb.checked,orderIndex:parseInt(cb.dataset.orderIndex)||0});});
-  document.querySelectorAll('[data-external-id]').forEach(function(cb){
-    var item={id:cb.dataset.externalId,name:cb.dataset.externalName,isInclude:cb.checked,orderIndex:parseInt(cb.dataset.orderIndex)||0};
-    var sel=document.querySelector('[data-external-select="'+cb.dataset.externalId+'"]');
-    if(sel&&sel.value){
-      var chosen=JSON.parse(sel.value);
-      item.versionId=chosen.versionId;
-      if(chosen.sourceBlobId)item.sourceBlobId=chosen.sourceBlobId;
-      item.contentType=(chosen.format||'').toUpperCase()==='PDF'?'ResourcePDF':'LiveSlide';
+  // Multiple documents can be attached to the same external-content slot: group checkboxes by
+  // slot id, then emit one manualSelectContentItem PER CHECKED candidate (all sharing that
+  // slot's id/name), or a single isInclude:false item if none are checked.
+  var extGroups={};
+  document.querySelectorAll('[data-external-candidate]').forEach(function(cb){
+    var id=cb.dataset.externalCandidate;
+    if(!extGroups[id])extGroups[id]={name:cb.dataset.externalName,orderIndex:parseInt(cb.dataset.orderIndex)||0,checked:[]};
+    if(cb.checked)extGroups[id].checked.push(JSON.parse(cb.value));
+  });
+  Object.keys(extGroups).forEach(function(id){
+    var g=extGroups[id];
+    if(g.checked.length){
+      g.checked.forEach(function(chosen){
+        var item={id:id,name:g.name,isInclude:true,orderIndex:g.orderIndex,versionId:chosen.versionId,contentType:(chosen.format||'').toUpperCase()==='PDF'?'ResourcePDF':'LiveSlide'};
+        if(chosen.sourceBlobId)item.sourceBlobId=chosen.sourceBlobId;
+        ms.push(item);
+      });
     }else{
-      item.contentType='LiveSlide';
-      item.isInclude=false;
+      ms.push({id:id,name:g.name,contentType:'LiveSlide',isInclude:false,orderIndex:g.orderIndex});
     }
-    ms.push(item);
   });
   var p={teamSiteId:tsid,libraryContentVersionId:vid,adHocInputs:adhoc,outputs:sel};
   if(vld.length)p.variableListData=vld;
@@ -1051,7 +1066,9 @@ function boolField(item: Record<string, unknown>, ...keys: string[]): boolean {
 // filter/format flags (the template author's actual search criteria, e.g. Filter: [{propertyName:
 // "ContentName", operator: "CT", value: "sp3"}]) over a generic name-based guess — those flags
 // are what get_livedoc_inputs actually returns on ExternalSlideContent items.
-async function resolveManualSelectCandidates(item: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
+const CANDIDATE_PAGE_SIZE = 10;
+
+async function resolveManualSelectCandidates(item: Record<string, unknown>): Promise<{ candidates: Array<Record<string, unknown>>; totalCount: number }> {
   const name = String(gf(item, "name") ?? "");
   const contentType = String(gf(item, "contentType") ?? "");
   const filter = (gf(item, "filter") as unknown[] | undefined) ?? [];
@@ -1077,7 +1094,7 @@ async function resolveManualSelectCandidates(item: Record<string, unknown>): Pro
     includeStandardPptx,
     includeLiveDoc,
     allowPdf,
-    page: { size: 5, from: 0 },
+    page: { size: CANDIDATE_PAGE_SIZE, from: 0 },
     orderBy: [{ attr: "modifiedDate", direction: "DESC" }],
   };
   if (filter.length > 0) {
@@ -1091,14 +1108,15 @@ async function resolveManualSelectCandidates(item: Record<string, unknown>): Pro
   }
 
   const result = await apiFetch("/v3/contents", { method: "POST", body: JSON.stringify(body) });
-  if (result.status !== 200) return [];
-  const data = result.body as { documents?: Array<Record<string, unknown>> };
-  return (data.documents ?? []).slice(0, 5).map((d) => ({
+  if (result.status !== 200) return { candidates: [], totalCount: 0 };
+  const data = result.body as { documents?: Array<Record<string, unknown>>; totalCount?: number };
+  const candidates = (data.documents ?? []).slice(0, CANDIDATE_PAGE_SIZE).map((d) => ({
     versionId: gf(d, "contentVersionId"),
     sourceBlobId: gf(d, "sourceBlobId"),
     title: gf(d, "title"),
     format: gf(d, "format"),
   }));
+  return { candidates, totalCount: data.totalCount ?? candidates.length };
 }
 
 async function handleGetInputs(args: {
@@ -1139,7 +1157,9 @@ async function handleGetInputs(args: {
     msItems.map(async (item) => {
       const contentType = String(gf(item, "contentType") ?? "");
       if (!needsContentResolution(contentType)) return;
-      item.candidates = await resolveManualSelectCandidates(item);
+      const resolved = await resolveManualSelectCandidates(item);
+      item.candidates = resolved.candidates;
+      item.candidatesTotalCount = resolved.totalCount;
     })
   );
 

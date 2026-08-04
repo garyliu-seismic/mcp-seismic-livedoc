@@ -941,14 +941,19 @@ async function handleSearchContent(args: {
   page_size?: number;
 }) {
   const size = Math.min(args.page_size ?? 10, 50);
-  // Map contentType to /v3/contents flags
+  // Map contentType to /v3/contents flags. allowPptx requires at least one of
+  // includeStandardPptx/includeLiveDoc also true, or the API rejects the request.
   const ct = args.contentType ?? "";
-  const allowPptx = !ct || ["ExternalSlides", "LiveSlide", "ExternalStaticSlides"].includes(ct);
-  const includeLiveDoc = !ct || ct === "LiveDoc";
+  const isSlideType = !ct || ["ExternalSlides", "LiveSlide", "ExternalStaticSlides"].includes(ct);
+  const isLiveDocType = !ct || ct === "LiveDoc";
+  const allowPptx = isSlideType || isLiveDocType;
+  const includeStandardPptx = isSlideType;
+  const includeLiveDoc = isSlideType || isLiveDocType;
   const allowPdf = !ct || ct === "PDF";
   const body = {
     searchText: args.query,
     allowPptx,
+    includeStandardPptx,
     includeLiveDoc,
     allowPdf,
     page: { size, from: 0 },
@@ -990,6 +995,64 @@ async function handleSearchContent(args: {
 // need a real "versionId" filled in before submission, never a fabricated one.
 const CONTENT_TYPES_REQUIRING_VERSION_ID = new Set(["LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage"]);
 
+// C# bool property names here don't follow simple camelCase (AllowPDF, IncludeStandardPPTX),
+// so check several literal casings rather than relying on gf()'s single-fallback capitalization.
+function boolField(item: Record<string, unknown>, ...keys: string[]): boolean {
+  for (const k of keys) {
+    if (typeof item[k] === "boolean") return item[k] as boolean;
+  }
+  return false;
+}
+
+// Resolves real content candidates for one manualSelectContentItem. Prefers the item's own
+// filter/format flags (the template author's actual search criteria, e.g. Filter: [{propertyName:
+// "ContentName", operator: "CT", value: "sp3"}]) over a generic name-based guess — those flags
+// are what get_livedoc_inputs actually returns on ExternalSlideContent items.
+async function resolveManualSelectCandidates(item: Record<string, unknown>): Promise<Array<Record<string, unknown>>> {
+  const name = String(gf(item, "name") ?? "");
+  const contentType = String(gf(item, "contentType") ?? "");
+  const filter = (gf(item, "filter") as unknown[] | undefined) ?? [];
+  const isApplyAllFilter = typeof item.isApplyAllFilter === "boolean" ? item.isApplyAllFilter : true;
+
+  let allowPptx = boolField(item, "allowPptx", "AllowPptx");
+  let includeStandardPptx = boolField(item, "includeStandardPptx", "IncludeStandardPPTX", "IncludeStandardPptx");
+  let includeLiveDoc = boolField(item, "includeLiveDoc", "IncludeLiveDoc");
+  let allowPdf = boolField(item, "allowPdf", "AllowPDF", "AllowPdf");
+
+  // Fall back to a contentType-based guess only if the item carried no usable format flags at all.
+  if (!allowPptx && !allowPdf) {
+    const isSlideType = ["ExternalSlides", "LiveSlide", "ExternalStaticSlides"].includes(contentType);
+    allowPptx = isSlideType;
+    includeStandardPptx = isSlideType;
+    includeLiveDoc = isSlideType;
+    allowPdf = !isSlideType;
+  }
+
+  const body: Record<string, unknown> = {
+    searchText: name,
+    allowPptx,
+    includeStandardPptx,
+    includeLiveDoc,
+    allowPdf,
+    page: { size: 5, from: 0 },
+    orderBy: [{ attr: "modifiedDate", direction: "DESC" }],
+  };
+  if (filter.length > 0) {
+    body.filter = filter;
+    body.isApplyAllFilter = isApplyAllFilter;
+  }
+
+  const result = await apiFetch("/v3/contents", { method: "POST", body: JSON.stringify(body) });
+  if (result.status !== 200) return [];
+  const data = result.body as { documents?: Array<Record<string, unknown>> };
+  return (data.documents ?? []).slice(0, 5).map((d) => ({
+    versionId: gf(d, "contentVersionId"),
+    sourceBlobId: gf(d, "sourceBlobId"),
+    title: gf(d, "title"),
+    format: gf(d, "format"),
+  }));
+}
+
 async function handleGetInputs(args: {
   teamSiteId: string;
   libraryContentVersionId: string;
@@ -1028,16 +1091,7 @@ async function handleGetInputs(args: {
     msItems.map(async (item) => {
       const contentType = String(gf(item, "contentType") ?? "");
       if (!CONTENT_TYPES_REQUIRING_VERSION_ID.has(contentType)) return;
-      const name = String(gf(item, "name") ?? "");
-      if (!name) {
-        item.candidates = [];
-        return;
-      }
-      const searchContentType = contentType === "ResourcePDF" || contentType === "ResourcePDFPage" ? "PDF" : contentType;
-      const searchResult = await handleSearchContent({ query: name, contentType: searchContentType, page_size: 5 });
-      item.candidates = "error" in searchResult
-        ? []
-        : searchResult.results.map((r) => ({ versionId: r.contentVersionId, sourceBlobId: r.sourceBlobId, title: r.name, format: r.format }));
+      item.candidates = await resolveManualSelectCandidates(item);
     })
   );
 

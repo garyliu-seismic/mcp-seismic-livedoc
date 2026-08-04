@@ -1574,7 +1574,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               text: [
                 recommendation +
                 `Create an HTML artifact using EXACTLY the HTML below, verbatim, with no modifications — it already has a working, tested submit mechanism wired to this MCP server. Do NOT hand-write your own form HTML for this.`,
-                `Immediately after creating the artifact, call wait_for_form_submit with token="${formToken}" — do not wait for the user to say anything first. That call blocks (up to 10 minutes) until the user clicks the form's submit button, then returns the exact payload to pass to submit_livedoc_generation.`,
+                `IMPORTANT: if the artifact-creation tool call errors, returns a validation failure, or you're unsure it actually succeeded — STOP. Do NOT proceed to call wait_for_form_submit anyway and do NOT describe the form as ready. A wait_for_form_submit call with no real rendered form blocks for up to 10 minutes accomplishing nothing, since the user has nothing to click. Instead, report the exact error to the user and suggest calling open_form_ui instead (a browser tab, not an artifact — avoids this failure mode entirely) or retrying.`,
+                `Only after the artifact is confirmed created successfully: immediately call wait_for_form_submit with token="${formToken}" — do not wait for the user to say anything first. That call blocks (up to 10 minutes) until the user clicks the form's submit button, then returns the exact payload to pass to submit_livedoc_generation.`,
                 ``,
                 "```html",
                 formHtml,

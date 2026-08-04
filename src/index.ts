@@ -970,6 +970,7 @@ async function handleSearchContent(args: {
       format: string;
       teamsite: string;
       modifiedDate: string;
+      sourceBlobId?: string;
     }>;
   };
   return {
@@ -979,6 +980,7 @@ async function handleSearchContent(args: {
       name: d.title,
       format: d.format,
       contentVersionId: d.contentVersionId,
+      sourceBlobId: d.sourceBlobId,
       modifiedDate: d.modifiedDate,
     })),
   };
@@ -1017,6 +1019,27 @@ async function handleGetInputs(args: {
   const forms = (raw.forms ?? raw.Forms) as Array<Record<string, unknown>> ?? [];
   const complex = isComplex(raw);
   const hasImageUpload = !!((imageUpload as Record<string, unknown> | undefined)?.imageUploadContentItems as unknown[] | undefined)?.length;
+
+  // Resolve external-content slots server-side instead of relying on the calling model to
+  // remember a separate search_livedoc_content step — that step was repeatedly skipped in
+  // practice, leaving the artifact with no real candidates to pick from.
+  const msItems = (manualSelect?.manualSelectContentItems as Array<Record<string, unknown>> | undefined) ?? [];
+  await Promise.all(
+    msItems.map(async (item) => {
+      const contentType = String(gf(item, "contentType") ?? "");
+      if (!CONTENT_TYPES_REQUIRING_VERSION_ID.has(contentType)) return;
+      const name = String(gf(item, "name") ?? "");
+      if (!name) {
+        item.candidates = [];
+        return;
+      }
+      const searchContentType = contentType === "ResourcePDF" || contentType === "ResourcePDFPage" ? "PDF" : contentType;
+      const searchResult = await handleSearchContent({ query: name, contentType: searchContentType, page_size: 5 });
+      item.candidates = "error" in searchResult
+        ? []
+        : searchResult.results.map((r) => ({ versionId: r.contentVersionId, sourceBlobId: r.sourceBlobId, title: r.name, format: r.format }));
+    })
+  );
 
   return {
     templateName,
@@ -1417,7 +1440,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 `- Variable list sections: same grid+table pattern with a section heading`,
                 `- Manual select groups (manualSelectContentInput.manualSelectContentItems):`,
                 `  - contentType "Group" or "Section": render as checkbox, checked by default (isInclude:true). Unchecked → isInclude:false. Include ALL items in payload.`,
-                `  - contentType "LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage" (external content): these slots need a real document assigned. THE ARTIFACT IS STATIC HTML IN A SANDBOXED IFRAME — IT CANNOT CALL MCP TOOLS AT RUNTIME. Do NOT render a live "Search" input/button inside the artifact for this — it will look like it works but silently does nothing. Instead: BEFORE creating the artifact, YOU must call search_livedoc_content(query=item.name, contentType=item.contentType) yourself, once per external-content item. Take the real results and bake them into the artifact as a static selectable list (radio buttons or a <select>) with each option's value already set to the real contentVersionId (and source blob id, if present) — no runtime search inside the iframe. In the payload: keep "id" UNCHANGED from get_livedoc_inputs (it's a stable slot identifier, not a content id — never replace it), set "versionId" to the selected option's contentVersionId, set "sourceBlobId" too if the result provides a distinct source blob id, isInclude=true. Never fabricate a versionId and never leave it unset while isInclude is true — if search finds nothing, set isInclude:false instead.`,
+                `  - contentType "LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage" (external content): these items already have a "candidates" array attached (pre-resolved server-side via search_livedoc_content — you do NOT need to call that tool yourself for these). Render "candidates" as a real dropdown/<select> or radio list of actual document titles — NOT a plain include/exclude checkbox, and NOT a live "Search" input (the artifact is static HTML in a sandboxed iframe and cannot call tools at runtime, so a search box would silently do nothing). If "candidates" is empty, show "No matching content found" and disable inclusion for that item — do not fabricate an option. In the payload: keep "id" UNCHANGED (it's a stable slot identifier, not a content id — never replace it), set "versionId"/"sourceBlobId" from the chosen candidate, isInclude=true.`,
                 `- Form selector: pill buttons for each unique form name — only show when there are 2+ distinct names`,
                 `- Output format: single-select pill buttons showing format codes joined by " + " (e.g. "PDF", "PPTX + PDF") — one button per forms[] entry`,
                 `- Submit button: collect all field values into the JSON payload shape below and send it as a user message so I can call submit_livedoc_generation`,

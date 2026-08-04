@@ -1152,7 +1152,7 @@ async function handleGetInputs(args: {
   // Resolve external-content slots server-side instead of relying on the calling model to
   // remember a separate search_livedoc_content step — that step was repeatedly skipped in
   // practice, leaving the artifact with no real candidates to pick from.
-  const msItems = (manualSelect?.manualSelectContentItems as Array<Record<string, unknown>> | undefined) ?? [];
+  const msItems = (manualSelect ? gf(manualSelect, "manualSelectContentItems") : undefined) as Array<Record<string, unknown>> | undefined ?? [];
   await Promise.all(
     msItems.map(async (item) => {
       const contentType = String(gf(item, "contentType") ?? "");

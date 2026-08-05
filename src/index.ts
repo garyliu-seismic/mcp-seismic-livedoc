@@ -13,6 +13,36 @@ import * as path from "path";
 import * as os from "os";
 import { exec } from "child_process";
 
+// Reads coworkUserFilesPath from the Claude Desktop config JSON.
+// Tries the standard %APPDATA%\Claude path first, then the Microsoft Store
+// package path (%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude).
+function findCoworkPath(): string {
+  const candidates: string[] = [];
+  const appdata = process.env.APPDATA;
+  const localAppdata = process.env.LOCALAPPDATA;
+  if (appdata) candidates.push(path.join(appdata, "Claude", "claude_desktop_config.json"));
+  if (localAppdata) {
+    const pkgsDir = path.join(localAppdata, "Packages");
+    try {
+      for (const entry of fs.readdirSync(pkgsDir)) {
+        if (entry.startsWith("Claude_")) {
+          candidates.push(path.join(pkgsDir, entry, "LocalCache", "Roaming", "Claude", "claude_desktop_config.json"));
+        }
+      }
+    } catch { /* Packages dir unreadable */ }
+  }
+  for (const cfgPath of candidates) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")) as Record<string, unknown>;
+      const p = cfg.coworkUserFilesPath;
+      if (typeof p === "string" && p) return p;
+    } catch { /* not found or not parseable */ }
+  }
+  return "";
+}
+
+const COWORK_PATH = process.env.CLAUDE_COWORK_PATH || findCoworkPath();
+
 const BASE_URL = process.env.SEISMIC_BASE_URL ?? "https://api.seismic.com/livedoc";
 
 const DEFAULT_AUTH_URI      = process.env.AUTH_SERVICE_URI    ?? "";
@@ -25,12 +55,27 @@ const DEFAULT_PASSWORD      = process.env.AUTH_PASSWORD        ?? "";
 // ── Tiny HTTP server for artifact form submissions ──────────────────────────
 const FORM_PORT = 3099;
 const pendingForms = new Map<string, (payload: unknown) => void>();
+const pendingFormHtml = new Map<string, string>(); // token → full HTML, served via GET /form/<token>
 
 const formHttpServer = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
+  // Serve form HTML so a small <iframe> wrapper can load it inside Claude Cowork.
+  const getForm = req.url?.match(/^\/form\/([^/?]+)/);
+  if (req.method === "GET" && getForm) {
+    const html = pendingFormHtml.get(getForm[1]);
+    if (html) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(html);
+    } else {
+      res.writeHead(404); res.end("Form not found or expired");
+    }
+    return;
+  }
+
   const m = req.url?.match(/^\/submit\/([^/?]+)/);
   if (req.method === "POST" && m) {
     const token = m[1];
@@ -40,9 +85,10 @@ const formHttpServer = http.createServer((req, res) => {
       const resolver = pendingForms.get(token);
       if (resolver) {
         pendingForms.delete(token);
+        pendingFormHtml.delete(token); // clean up served HTML
         try { resolver(JSON.parse(body)); } catch { resolver(body); }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(`<!DOCTYPE html><html><head><title>Submitted</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f0fdf4}div{text-align:center;color:#166534}</style></head><body><div><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#16a34a" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><h2>Form submitted!</h2><p>Claude is now generating your document.</p></div></body></html>`);
       } else {
         res.writeHead(410); res.end("expired");
       }
@@ -170,7 +216,7 @@ const tools: Tool[] = [
   {
     name: "search_livedoc_content",
     description:
-      "Search the Seismic library for content items by keyword. Use this when a LiveDoc template has external content inputs (e.g. contentType 'ExternalSlides', 'LiveSlide', 'ExternalStaticSlides') — search for the real document the user wants to include, then use the returned contentVersionId as the id in the submission payload.",
+      "Search the Seismic library for content items by keyword. This is NOT part of the normal LiveDoc generation flow — do not call it to resolve versionId for manualSelectContentItems. It is only for standalone content discovery when the user explicitly asks to search for content, or when get_livedoc_inputs returns externalContentInput candidates that need to be resolved before showing the form.",
     inputSchema: {
       type: "object",
       properties: {
@@ -195,7 +241,7 @@ const tools: Tool[] = [
   {
     name: "get_livedoc_inputs",
     description:
-      "Retrieve the full input schema for a LiveDoc template version — ad hoc variables, variable lists, image placeholders, manual select groups, and available output forms. Call this before submitting generation to know what inputs are required. IMPORTANT: After this tool returns, you MUST immediately present a friendly input form to the user: show each adHocInputDefinition as a labelled field (use AskUserQuestion for fields with predefined choices, a markdown table for free-text fields). Do not ask the user whether to show the form — just show it.",
+      "Retrieve the full input schema for a LiveDoc template version and open the input form. This tool opens an HTML form in the browser automatically and returns exact instructions — follow those instructions verbatim. Do NOT build your own form, do NOT use AskUserQuestion, do NOT use markdown tables for inputs. If the tool says create a Cowork artifact with specific HTML, do that. If it says call wait_for_form_submit, do that immediately.",
     inputSchema: {
       type: "object",
       properties: {
@@ -285,9 +331,9 @@ const tools: Tool[] = [
         manualSelectContentInput: {
           type: "object",
           description:
-            'Content selection (from get_livedoc_inputs\' ManualSelectContentInput.ManualSelectContentItems). Everything is included by default - only pass items you want to EXCLUDE, with isInclude: false, or items that need a resolved versionId (see below). ' +
-            'IMPORTANT: "id" is a stable SLOT identifier from get_livedoc_inputs — always echo it back UNCHANGED, never replace it with a resolved content id. ' +
-            'For contentType "LiveSlide", "ExternalStaticSlides", "ResourcePDF", or "ResourcePDFPage": these slots need a real piece of content assigned. Call search_livedoc_content(query: item.name, contentType: item.contentType) to find it, then set "versionId" to the result\'s contentVersionId (and "sourceBlobId" too if the search result provides a distinct source blob id — needed for ExternalStaticSlides/slide-source references). For "ResourcePDFPage", also set "pageNumber". Do NOT invent a versionId — if search_livedoc_content finds nothing, leave the item out or set isInclude:false rather than fabricating one.',
+            'Content selection payload — pass this field ONLY with the exact payload returned by wait_for_form_submit. Do NOT populate this yourself by calling search_livedoc_content or any other tool. ' +
+            'IMPORTANT: "id" is a stable SLOT identifier — always echo it back UNCHANGED from the wait_for_form_submit payload. ' +
+            'versionId, sourceBlobId, and pageNumber must come from the form submission payload via wait_for_form_submit — never resolve these yourself.',
           properties: {
             manualSelectContentItems: {
               type: "array",
@@ -304,7 +350,7 @@ const tools: Tool[] = [
                   versionId: {
                     type: "string",
                     description:
-                      "Resolved contentVersionId from search_livedoc_content. Required for LiveSlide/ExternalStaticSlides/ResourcePDF/ResourcePDFPage items being included — never fabricate this value.",
+                      "contentVersionId from the wait_for_form_submit payload. Never populate this yourself — it must come from the form submission.",
                   },
                   sourceBlobId: {
                     type: "string",
@@ -344,7 +390,7 @@ const tools: Tool[] = [
   {
     name: "open_form_ui",
     description:
-      "Returns a deep-link URL that opens the LiveDoc Form UI for a complex template. Call this when get_livedoc_inputs returns isComplex=true. Optionally pass prefillValues to pre-populate form fields with AI-suggested defaults — the user can review and edit before generating. The form UI renders all widgets (tables, image uploads, slide selectors) and handles generation and download.",
+      "Opens the LiveDoc Form Web App for templates that require image uploads. Call this ONLY when get_livedoc_inputs explicitly instructs you to call it (hasImageUpload case). Do NOT call this based on isComplex or any other field — isComplex does NOT trigger this tool. Optionally pass prefillValues to pre-populate form fields. After the user submits the Form Web App, call get_form_result (NOT wait_for_form_submit) with the returned token.",
     inputSchema: {
       type: "object",
       properties: {
@@ -641,6 +687,25 @@ function tableInput(name: string, columns: Array<Record<string, unknown>>, scope
   return `<div class="tbl-wrap"><div class="sl">${esc(name)}</div><table class="dt" data-table-id="${tid}" data-table-scope="${scope}" data-table-name="${esc(name)}"${vlAttr} data-cols="${colsAttr}"><thead><tr>${ths}</tr></thead><tbody id="${tid}-body"></tbody></table><button class="add-btn" onclick="addRow('${tid}')">+ Add row</button></div>`;
 }
 
+function contentTypeIconSvg(contentType: string): string {
+  const t = (contentType ?? "").toLowerCase();
+  const svg = (body: string) => `<svg class="ct-icon" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">${body}</svg>`;
+  if (t === "group") {
+    // Folder
+    return svg(`<path fill="#f59e0b" d="M1 3.5A1.5 1.5 0 012.5 2H6l1.5 2H13.5A1.5 1.5 0 0115 5.5v7A1.5 1.5 0 0113.5 14h-11A1.5 1.5 0 011 12.5z"/>`);
+  }
+  if (t === "section") {
+    // Stacked layers
+    return svg(`<path fill="#6b7280" d="M8.235 1.56a.5.5 0 00-.47 0l-7.5 4 7.5 4 7.5-4-7.5-4zm-7.13 8.96l7 3.734 7-3.734-1-.534L8 13.197 1.895 10.52l-1-.535-.789.535z"/>`);
+  }
+  if (t === "resourcepdf" || t === "pdf" || t === "resourcepdfpage") {
+    // Document (red)
+    return svg(`<path fill="#dc2626" d="M9.5 0H4a2 2 0 00-2 2v12a2 2 0 002 2h8a2 2 0 002-2V4.5L9.5 0zm0 1.5V4a.5.5 0 00.5.5H13V14a1 1 0 01-1 1H4a1 1 0 01-1-1V2a1 1 0 011-1h5.5z"/><path fill="#dc2626" d="M4.5 8h7v1h-7zm0 2h7v1h-7zm0 2h4v1h-4z"/>`);
+  }
+  // Default: presentation/slides
+  return svg(`<path fill="#3b82f6" d="M0 2.5A1.5 1.5 0 011.5 1h13A1.5 1.5 0 0116 2.5v9A1.5 1.5 0 0114.5 13H9l.5.5H11a.5.5 0 010 1H5a.5.5 0 010-1h1.5l.5-.5H1.5A1.5 1.5 0 010 11.5zm1.5-.5a.5.5 0 00-.5.5v9a.5.5 0 00.5.5h13a.5.5 0 00.5-.5v-9a.5.5 0 00-.5-.5z"/>`);
+}
+
 function buildFormHtml(
   templateName: string,
   adhocInputs: Array<Record<string, unknown>>,
@@ -683,25 +748,35 @@ function buildFormHtml(
     const groups = items.filter(i => ["Group", "Section"].includes(String(gf(i, "contentType") ?? "")));
     const external = items.filter(i => !["Group", "Section"].includes(String(gf(i, "contentType") ?? "")));
 
+    const hasGroupImages = groups.some(g => !!gf(g, "imageUrl"));
     const checks = groups.map(g => {
       const gId = esc(String(gf(g, "id") ?? ""));
       const gName = esc(String(gf(g, "name") ?? ""));
-      const gType = esc(String(gf(g, "contentType") ?? "Group"));
+      const gType = String(gf(g, "contentType") ?? "Group");
+      const gTypeEsc = esc(gType);
       const inc = gf(g, "isInclude") !== false ? " checked" : "";
       const oi = Number(gf(g, "orderIndex") ?? 0);
-      return `<label class="grp"><input type="checkbox"${inc} data-group-id="${gId}" data-group-name="${gName}" data-order-index="${oi}" data-content-type="${gType}"> <span>${gName}</span></label>`;
+      const imgUrl = String(gf(g, "imageUrl") ?? "");
+      const labelEl = `<label class="grp"><input type="checkbox"${inc} data-group-id="${gId}" data-group-name="${gName}" data-order-index="${oi}" data-content-type="${gTypeEsc}">${contentTypeIconSvg(gType)}<span>${gName}</span></label>`;
+      if (imgUrl) {
+        return `<div class="grp-card"><img class="grp-thumb" src="${esc(imgUrl)}" alt="${gName}" loading="lazy" crossorigin="anonymous" onerror="this.style.display='none'">${labelEl}</div>`;
+      }
+      return labelEl;
     }).join("");
+    const listClass = hasGroupImages ? "grp-list grp-list-cards" : "grp-list";
     const groupsHtml = groups.length
-      ? `<div class="section"><div class="sl">Content selection</div><div class="grp-list">${checks}</div></div>`
+      ? `<div class="section"><div class="sl">Content selection</div><div class="${listClass}">${checks}</div></div>`
       : "";
 
     const externalHtml = external.map(item => {
       const iId = esc(String(gf(item, "id") ?? ""));
       const iName = esc(String(gf(item, "name") ?? ""));
+      const iContentType = String(gf(item, "contentType") ?? "");
+      const iIcon = contentTypeIconSvg(iContentType);
       const oi = Number(gf(item, "orderIndex") ?? 0);
       const candidates = (gf(item, "candidates") as Array<Record<string, unknown>> | undefined) ?? [];
       if (!candidates.length) {
-        return `<div class="ext-item"><div class="sl" style="margin-bottom:6px">${iName}</div><span class="badge" style="background:#fde8e8;color:#c00">No matching content found</span></div>`;
+        return `<div class="ext-item"><div class="sl" style="margin-bottom:6px">${iIcon}${iName}</div><span class="badge" style="background:#fde8e8;color:#c00">No matching content found</span></div>`;
       }
       const totalCount = Number(gf(item, "candidatesTotalCount") ?? candidates.length);
       const truncatedNote = totalCount > candidates.length
@@ -712,11 +787,13 @@ function buildFormHtml(
       // that all share this slot's id/name but carry different resolved versionId/format.
       const candidateChecks = candidates.map((c, i) => {
         const val = esc(JSON.stringify({ versionId: gf(c, "versionId"), sourceBlobId: gf(c, "sourceBlobId"), format: gf(c, "format") }));
-        const label = esc(`${String(gf(c, "title") ?? "")} (${String(gf(c, "format") ?? "")})`);
+        const cFormat = String(gf(c, "format") ?? "");
+        const cIcon = contentTypeIconSvg(cFormat.toLowerCase() === "pdf" ? "resourcepdf" : "liveslide");
+        const label = esc(`${String(gf(c, "title") ?? "")} (${cFormat})`);
         const checkedAttr = i === 0 ? " checked" : "";
-        return `<label class="grp"><input type="checkbox"${checkedAttr} data-external-candidate="${iId}" data-external-name="${iName}" data-order-index="${oi}" value='${val}'> <span>${label}</span></label>`;
+        return `<label class="grp"><input type="checkbox"${checkedAttr} data-external-candidate="${iId}" data-external-name="${iName}" data-order-index="${oi}" value='${val}'>${cIcon}<span>${label}</span></label>`;
       }).join("");
-      return `<div class="ext-item"><div class="sl" style="margin-bottom:6px">${iName}${truncatedNote}</div><div class="grp-list">${candidateChecks}</div></div>`;
+      return `<div class="ext-item"><div class="sl" style="margin-bottom:6px">${iIcon}${iName}${truncatedNote}</div><div class="grp-list">${candidateChecks}</div></div>`;
     }).join("");
 
     msHtml = groupsHtml + (externalHtml ? `<div class="section"><div class="sl">External content</div>${externalHtml}</div>` : "");
@@ -793,7 +870,14 @@ body{background:#fff;padding:20px;font-size:14px;color:#1d1d1f}
 .grp-list{display:flex;flex-direction:column;gap:8px}
 .grp{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px}
 .grp input{width:16px;height:16px}
-.ext-item{margin-bottom:14px;padding:10px 12px;border:1px solid #e5e5e5;border-radius:8px}`;
+.ext-item{margin-bottom:14px;padding:10px 12px;border:1px solid #e5e5e5;border-radius:8px}
+.ct-icon{width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right:5px;flex-shrink:0}
+.grp-list-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
+.grp-card{border:1px solid #e5e5e5;border-radius:8px;overflow:hidden;cursor:pointer;transition:box-shadow .15s}
+.grp-card:hover{box-shadow:0 2px 8px rgba(0,0,0,.1)}
+.grp-card:has(input:checked){border-color:#0066cc;box-shadow:0 0 0 2px rgba(0,102,204,.15)}
+.grp-thumb{width:100%;height:80px;object-fit:cover;display:block;background:#f0f2f5}
+.grp-card .grp{padding:8px 10px}`;
 
   const js = `var sel=${initOutputs};
 var tsid=${JSON.stringify(teamSiteId)};
@@ -914,6 +998,7 @@ function submit(){
     btn.style.display='none';
     pt.select();
     try{navigator.clipboard.writeText(msg);}catch(e){}
+    document.getElementById('paste-hint').style.display='block';
     window.scrollTo(0,document.body.scrollHeight);
   });
 }
@@ -935,6 +1020,9 @@ ${formSelHtml}
   <div style="font-weight:600;font-size:13px;margin-bottom:8px;color:#0055aa">Copy this payload and paste it into the chat:</div>
   <textarea id="payload-text" readonly style="width:100%;height:72px;font-size:11px;font-family:monospace;border:1px solid #b0c8e8;border-radius:4px;padding:6px;box-sizing:border-box;resize:none;background:#fff"></textarea>
   <button id="copy-btn" onclick="copyPayload()" style="margin-top:8px;padding:7px 20px;background:#0066cc;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">&#128203; Copy to clipboard</button>
+</div>
+<div id="paste-hint" style="display:none;margin-top:12px;padding:12px 14px;background:#fff8e1;border:1.5px solid #f9a825;border-radius:8px;font-size:13px;color:#5d4037">
+  <b>Auto-submit unavailable in this view.</b><br>The payload has been copied to your clipboard. Paste it into the chat and Claude will continue from there.
 </div>
 <script>${js}<\/script>
 </body></html>`;
@@ -1217,8 +1305,8 @@ async function handleSubmitGeneration(args: {
     );
     if (unresolved.length > 0) {
       return {
-        error: "manualSelectContentInput has items missing a resolved versionId.",
-        detail: `Item(s) [${unresolved.map((i) => `"${i.name ?? i.id}"`).join(", ")}] have contentType requiring real content but no versionId. Call get_livedoc_inputs again and use the resolved "candidates" it attaches to this item, or call search_livedoc_content(query: <item name>, contentType: <item contentType>) directly, then set versionId to the result's contentVersionId — never fabricate one. If no match, set isInclude:false instead.`,
+        error: "WRONG TOOL — do not call submit_livedoc_generation directly when manualSelectContentInput has unresolved items.",
+        detail: `Item(s) [${unresolved.map((i) => `"${i.name ?? i.id}"`).join(", ")}] are missing versionId. You must NOT resolve versionId yourself via search_livedoc_content or any other tool. The correct flow is: (1) get_livedoc_inputs opens an HTML form, (2) the USER fills in the form and clicks Submit, (3) you call wait_for_form_submit to receive the fully-resolved payload, (4) THEN call this tool with that exact payload. If you have not yet called wait_for_form_submit, call it now with the token from get_livedoc_inputs.`,
       };
     }
   }
@@ -1449,10 +1537,15 @@ async function handleOpenFormUi(args: { teamSiteId: string; libraryContentVersio
     params.set("prefill", Buffer.from(JSON.stringify(args.prefillValues)).toString("base64"));
   }
   const url = `${FORM_APP_BASE}/form?${params}`;
+  openWithDefaultApp(url);
   return {
     url,
     token,
-    message: `Open this URL in your browser: ${url}\n\nAfter the form tab closes automatically, call get_form_result with token="${token}" to retrieve the generation result into this context.`,
+    message: [
+      `The form has been opened in the browser: ${url}`,
+      `IMPORTANT: Call get_form_result with token="${token}" after the user submits the form — NOT wait_for_form_submit (that tool is for a different code path and will hang forever here).`,
+      `get_form_result polls until the form app posts the result, then returns the generatedLivedocId and outputs.`,
+    ].join("\n"),
   };
 }
 
@@ -1551,14 +1644,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         if (ir.hasImageUpload) {
           return {
-            content: [{ type: "text" as const, text: "This template requires image uploads. Use open_form_ui to open the full form in a browser tab." }],
+            content: [{ type: "text" as const, text: `This template requires image uploads which the inline form cannot handle. Call open_form_ui with teamSiteId="${ir.teamSiteId}" and libraryContentVersionId="${ir.libraryContentVersionId}". After the user submits, call get_form_result (NOT wait_for_form_submit) with the token.` }],
           };
         }
-        if (ir.isComplex) {
-          return {
-            content: [{ type: "text" as const, text: "This is a complex template. Use open_form_ui to open the full form in a browser tab instead of building an inline artifact." }],
-          };
-        }
+        // All other "complex" cases (variable lists with data sources, many adhoc inputs,
+        // manual-select content) are handled by the inline HTML form — do not redirect to
+        // open_form_ui unless image upload is involved.
         const formToken = generateToken();
         const formHtml = buildFormHtml(
           ir.templateName,
@@ -1571,38 +1662,81 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           formToken
         );
 
-        // Write the pre-built HTML straight to disk and open it in the browser, rather than
-        // relaying a 13-16KB HTML+JS blob through create_artifact — that relay is what a model
-        // has to reproduce verbatim as a tool-call argument, and it has repeatedly corrupted or
-        // failed outright (same failure class as long JWTs corrupting through chat relay). A
-        // file path is a few dozen characters; there's nothing left for the model to get wrong.
         const safeName = ir.templateName.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || "livedoc-form";
-        const formFilePath = uniqueFilePath(getDownloadsDir(), `${safeName} (${formToken}).html`);
+        const formFileName = `${safeName} (${formToken}).html`;
+
+        // Write form HTML to disk and open in the default browser — this is the submit path.
+        const formFilePath = uniqueFilePath(getDownloadsDir(), formFileName);
         fs.writeFileSync(formFilePath, formHtml);
         openWithDefaultApp(formFilePath);
+
+        // Also store for HTTP serving (GET /form/<token>) as an alternative access route.
+        pendingFormHtml.set(formToken, formHtml);
+
+        // Cowork artifact: clean status panel — the sandbox blocks all external access so
+        // we don't attempt any redirect. The real form is in the browser.
+        const statusHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:28px;background:#fff;color:#1d1d1f}h2{font-size:16px;font-weight:700;margin:0 0 10px}p{font-size:13px;color:#555;margin:0 0 8px;line-height:1.5}.token{font-family:monospace;font-size:11px;background:#f5f5f5;padding:3px 7px;border-radius:4px;color:#333}.waiting{display:flex;align-items:center;gap:8px;margin-top:16px;font-size:13px;color:#0066cc}@keyframes spin{to{transform:rotate(360deg)}}.spinner{width:14px;height:14px;border:2px solid #cce0ff;border-top-color:#0066cc;border-radius:50%;animation:spin 0.8s linear infinite}</style></head><body><h2>&#128196; LiveDoc Form</h2><p>The input form has been opened in your browser.<br>Fill it in and click <b>Submit generation</b>.</p><p>Token: <span class="token">${formToken}</span></p><div class="waiting"><div class="spinner"></div>Waiting for your submission…</div></body></html>`;
 
         return {
           content: [
             {
               type: "text" as const,
               text: [
-                `The input form for "${ir.templateName}" has been opened in the browser: ${formFilePath}`,
-                `Tell the user to fill it out and click Submit there. Immediately call wait_for_form_submit with token="${formToken}" now — do not wait for the user to say anything first. That call blocks (up to 10 minutes) until the form is submitted, then returns the exact payload to pass to submit_livedoc_generation.`,
-                `Do NOT build an in-chat HTML artifact for this — the file just opened already has a working, tested submit mechanism wired to this MCP server.`,
+                `Create a Claude Cowork artifact (type: HTML) with this exact content (relay verbatim):`,
+                statusHtml,
+                `The form has been opened in the user's browser. Immediately call wait_for_form_submit with token="${formToken}". Do NOT call submit_livedoc_generation yourself.`,
               ].join("\n"),
             },
           ],
         };
       }
-      case "wait_for_form_submit":
-        result = await handleWaitForFormSubmit(args as { token: string });
-        break;
-      case "submit_livedoc_generation":
-        result = await handleSubmitGeneration(args as Parameters<typeof handleSubmitGeneration>[0]);
-        break;
-      case "get_generation_status":
-        result = await handleGetStatus(args as { generatedLivedocId: string });
-        break;
+      case "wait_for_form_submit": {
+        const payload = await handleWaitForFormSubmit(args as { token: string });
+        return {
+          content: [{
+            type: "text" as const,
+            text: [
+              "Form submitted. NEXT: call submit_livedoc_generation immediately with this exact payload — do not modify it:",
+              JSON.stringify(payload, null, 2),
+            ].join("\n"),
+          }],
+        };
+      }
+      case "submit_livedoc_generation": {
+        const subResult = await handleSubmitGeneration(args as Parameters<typeof handleSubmitGeneration>[0]);
+        const subBody = subResult as Record<string, unknown>;
+        if (subBody.error) {
+          return { content: [{ type: "text" as const, text: JSON.stringify(subBody, null, 2) }], isError: true };
+        }
+        const gid = String(subBody.generatedLivedocId ?? "");
+        return {
+          content: [{
+            type: "text" as const,
+            text: [
+              `Generation started. generatedLivedocId: ${gid}`,
+              `NEXT: call get_generation_status with generatedLivedocId="${gid}". Keep calling every few seconds until allDone=true.`,
+            ].join("\n"),
+          }],
+        };
+      }
+      case "get_generation_status": {
+        const statusResult = await handleGetStatus(args as { generatedLivedocId: string });
+        const st = statusResult as Record<string, unknown>;
+        if (st.error) {
+          return { content: [{ type: "text" as const, text: JSON.stringify(st, null, 2) }], isError: true };
+        }
+        const outputs = (st.outputs as Array<Record<string, unknown>>) ?? [];
+        const allDone = st.allDone as boolean;
+        const nextStep = allDone
+          ? `All done. NEXT: call download_generation_output for each completed output:\n${outputs.filter(o => o.status === "Completed").map(o => `  outputId="${o.id}" (${o.format} — ${o.fileName})`).join("\n")}`
+          : `Still generating. NEXT: call get_generation_status again with generatedLivedocId="${st.generatedLivedocId}" in a few seconds.`;
+        return {
+          content: [{
+            type: "text" as const,
+            text: [JSON.stringify(st, null, 2), nextStep].join("\n\n"),
+          }],
+        };
+      }
       case "open_form_ui":
         result = await handleOpenFormUi(args as { teamSiteId: string; libraryContentVersionId: string; context?: string });
         break;

@@ -86,6 +86,8 @@ const DEFAULT_PASSWORD      = process.env.AUTH_PASSWORD        ?? "";
 const FORM_PORT = 3099;
 const pendingForms = new Map<string, (payload: unknown) => void>();
 const pendingFormHtml = new Map<string, string>(); // token → full HTML, served via GET /form/<token>
+// Submissions that arrived before wait_for_form_submit was called (race-condition buffer).
+const preReceivedPayloads = new Map<string, unknown>();
 
 const formHttpServer = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -123,6 +125,7 @@ const formHttpServer = http.createServer((req, res) => {
     req.on("data", (chunk: Buffer) => { body += chunk; });
     req.on("end", () => {
       const resolver = pendingForms.get(token);
+      fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] HTTP_SUBMIT pid=${process.pid} token=${token} resolverFound=${!!resolver} pendingSize=${pendingForms.size} preSize=${preReceivedPayloads.size}\n`);
       if (resolver) {
         pendingForms.delete(token);
         pendingFormHtml.delete(token); // clean up served HTML
@@ -130,7 +133,9 @@ const formHttpServer = http.createServer((req, res) => {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(`<!DOCTYPE html><html><head><title>Submitted</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f0fdf4}div{text-align:center;color:#166534}</style></head><body><div><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#16a34a" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><h2>Form submitted!</h2><p>Claude is now generating your document.</p></div></body></html>`);
       } else {
-        res.writeHead(410); res.end("expired");
+        // wait_for_form_submit not called yet — buffer the payload so it can pick it up immediately when called.
+        try { preReceivedPayloads.set(token, JSON.parse(body)); } catch { preReceivedPayloads.set(token, body); }
+        res.writeHead(200, { "Content-Type": "text/plain" }); res.end("buffered");
       }
     });
   } else {
@@ -1177,16 +1182,49 @@ function generateToken(): string {
 }
 
 async function handleWaitForFormSubmit(args: { token: string }): Promise<unknown> {
+  const dbg = (msg: string) => fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] WAIT_SUBMIT pid=${process.pid} token=${args.token} ${msg}\n`);
+  dbg(`called preSize=${preReceivedPayloads.size} pendingSize=${pendingForms.size}`);
+  const submitFile = path.join(os.tmpdir(), `livedoc-submit-${args.token}.json`);
   const TIMEOUT_MS = 10 * 60 * 1000;
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    const done = (payload: unknown) => {
+      clearTimeout(timer);
+      clearInterval(poller);
       pendingForms.delete(args.token);
+      dbg("resolved");
+      resolve(payload);
+    };
+    const timer = setTimeout(() => {
+      clearInterval(poller);
+      pendingForms.delete(args.token);
+      dbg("timeout");
       reject(new Error("Form submission timed out after 10 minutes."));
     }, TIMEOUT_MS);
-    pendingForms.set(args.token, (payload) => {
-      clearTimeout(timer);
-      resolve(payload);
-    });
+    // In-process resolver (same process as receive_form_submission).
+    pendingForms.set(args.token, (payload) => done(payload));
+    // Cross-process file poller (different process wrote the file).
+    const poller = setInterval(() => {
+      if (fs.existsSync(submitFile)) {
+        try {
+          const raw = fs.readFileSync(submitFile, "utf-8");
+          fs.unlinkSync(submitFile);
+          dbg("resolved via file");
+          done(JSON.parse(raw));
+        } catch (e) {
+          reject(e);
+        }
+      }
+    }, 500);
+    // Check immediately in case file was written before we started polling.
+    if (fs.existsSync(submitFile)) {
+      try {
+        const raw = fs.readFileSync(submitFile, "utf-8");
+        fs.unlinkSync(submitFile);
+        dbg("fast-path file");
+        done(JSON.parse(raw));
+      } catch (e) { /* poller will retry */ }
+    }
+    dbg(`resolver registered, polling ${submitFile}`);
   });
 }
 
@@ -1431,7 +1469,7 @@ registerAppTool(
     return {
       content: [{
         type: "text" as const,
-        text: `Form loaded (token="${formToken}"). The form is now showing in the MCP App panel. After the user fills it in and clicks Submit, call wait_for_form_submit with token="${formToken}". If the panel does not appear, the user can open **${formFileName}** from the Working folder panel instead.`,
+        text: `Form loaded (token="${formToken}"). The form is now showing in the MCP App panel. Call wait_for_form_submit NOW with token="${formToken}" — do not wait for the user to say anything first; the tool will block until they submit. If the panel does not appear, the user can open **${formFileName}** from the Working folder panel instead.`,
       }],
       structuredContent: { formToken, formUrl, formHtml },
     };
@@ -1492,23 +1530,17 @@ server.registerTool(
       pendingForms.delete(token);
       pendingFormHtml.delete(token);
       try { resolver(JSON.parse(payload)); } catch { resolver(payload); }
+      fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
+        `[${new Date().toISOString()}] receive_form_submission: resolved in-process\n`);
       return { content: [{ type: "text" as const, text: "ok" }] };
     }
-    // Cross-process fallback: relay via server-side HTTP POST to the form server on port 3099.
-    // Node.js HTTP requests are not subject to browser CSP, so this always reaches Process 1.
-    await new Promise<void>((resolve, reject) => {
-      const body = Buffer.from(payload, "utf-8");
-      const req = http.request(
-        { hostname: "127.0.0.1", port: FORM_PORT, path: `/submit/${encodeURIComponent(token)}`, method: "POST",
-          headers: { "Content-Type": "application/json", "Content-Length": body.length } },
-        (res) => { res.resume(); resolve(); }
-      );
-      req.on("error", reject);
-      req.write(body);
-      req.end();
-    });
+    // Cross-process fallback: write a temp file that wait_for_form_submit polls.
+    // Two separate Node.js processes are spawned by Claude Desktop — they share no memory,
+    // and only one of them wins port 3099, so HTTP relay is unreliable.
+    const submitFile = path.join(os.tmpdir(), `livedoc-submit-${token}.json`);
+    fs.writeFileSync(submitFile, payload, "utf-8");
     fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
-      `[${new Date().toISOString()}] receive_form_submission: relayed via HTTP\n`);
+      `[${new Date().toISOString()}] receive_form_submission: wrote file ${submitFile}\n`);
     return { content: [{ type: "text" as const, text: "ok" }] };
   }
 );

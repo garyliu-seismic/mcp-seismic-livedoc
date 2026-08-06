@@ -1,17 +1,47 @@
 #!/usr/bin/env node
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import { registerAppTool, registerAppResource, RESOURCE_MIME_TYPE, getUiCapability } from "@modelcontextprotocol/ext-apps/server";
+import { build } from "esbuild";
+import { z } from "zod";
 import * as http from "http";
 import { randomUUID } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { exec } from "child_process";
+import { fileURLToPath } from "url";
+
+// Bundle @modelcontextprotocol/ext-apps (App class + deps) into a browser IIFE at startup.
+// This avoids relying on Claude Desktop to inject an import map for bare specifiers.
+let _extAppsBundleCache: string | null = null;
+async function getExtAppsBundle(): Promise<string> {
+  if (_extAppsBundleCache !== null) return _extAppsBundleCache;
+  try {
+    // resolveDir must be the package root (parent of node_modules).
+    // dist/index.js → dist/ → package root; src/index.ts → src/ → package root.
+    const pkgRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const result = await build({
+      stdin: {
+        contents: `import { App } from "@modelcontextprotocol/ext-apps"; globalThis.__McpApp = { App };`,
+        resolveDir: pkgRoot,
+      },
+      bundle: true,
+      format: "iife",
+      write: false,
+      platform: "browser",
+      logLevel: "silent",
+    });
+    _extAppsBundleCache = Buffer.from(result.outputFiles[0].contents).toString("utf-8");
+    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
+      `[${new Date().toISOString()}] ext-apps bundle: ${_extAppsBundleCache.length} bytes OK\n`);
+  } catch (e) {
+    _extAppsBundleCache = `console.error("[livedoc] ext-apps bundle failed:", ${JSON.stringify(String(e))});`;
+    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
+      `[${new Date().toISOString()}] ext-apps bundle FAILED: ${e}\n`);
+  }
+  return _extAppsBundleCache;
+}
 
 // Reads coworkUserFilesPath from the Claude Desktop config JSON.
 // Tries the standard %APPDATA%\Claude path first, then the Microsoft Store
@@ -63,10 +93,20 @@ const formHttpServer = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
+  // Debug ping: GET /ping/<message> — logs from the App panel iframe for diagnostics.
+  const pingMatch = req.url?.match(/^\/ping\/(.+)/);
+  if (req.method === "GET" && pingMatch) {
+    const msg = decodeURIComponent(pingMatch[1]);
+    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] APP_PANEL: ${msg}\n`);
+    res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok");
+    return;
+  }
+
   // Serve form HTML so a small <iframe> wrapper can load it inside Claude Cowork.
   const getForm = req.url?.match(/^\/form\/([^/?]+)/);
   if (req.method === "GET" && getForm) {
     const html = pendingFormHtml.get(getForm[1]);
+    fs.appendFileSync(require("path").join(require("os").tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] HTTP GET /form/${getForm[1]}: found=${html !== undefined}\n`);
     if (html) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(html);
@@ -191,454 +231,82 @@ function isComplex(resp: Record<string, unknown>): boolean {
 
 // ── Tool definitions ────────────────────────────────────────────────────────
 
-const tools: Tool[] = [
-  {
-    name: "search_livedoc_templates",
-    description:
-      "Search for LiveDoc (Document Generator) templates in Seismic by name or keyword. Returns contentVersionId and teamSiteId needed for other tools. " +
-      "ALWAYS call this FIRST whenever the user names or describes a template (e.g. \"generate ContentSelectorForm\") — do NOT ask the user for teamSiteId/libraryContentVersionId directly; those are internal ids the user is unlikely to know. Only ask the user to disambiguate if this search returns zero or multiple plausible matches.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        searchText: {
-          type: "string",
-          description: "Text to search across template title, description, and body.",
-        },
-        page_size: {
-          type: "number",
-          description: "Number of results to return (default 10, max 50).",
-          default: 10,
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "search_livedoc_content",
-    description:
-      "Search the Seismic library for content items by keyword. This is NOT part of the normal LiveDoc generation flow — do not call it to resolve versionId for manualSelectContentItems. It is only for standalone content discovery when the user explicitly asks to search for content, or when get_livedoc_inputs returns externalContentInput candidates that need to be resolved before showing the form.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "Search text (title or keyword).",
-        },
-        contentType: {
-          type: "string",
-          enum: ["ExternalSlides", "LiveSlide", "ExternalStaticSlides", "LiveDoc", "PDF"],
-          description: "Filter by content type. Pass the contentType value exactly as it appears in the template's manualSelectContentItems.",
-        },
-        page_size: {
-          type: "number",
-          description: "Number of results to return (default 10, max 50).",
-          default: 10,
-        },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    name: "get_livedoc_inputs",
-    description:
-      "Retrieve the full input schema for a LiveDoc template version and open the input form. This tool opens an HTML form in the browser automatically and returns exact instructions — follow those instructions verbatim. Do NOT build your own form, do NOT use AskUserQuestion, do NOT use markdown tables for inputs. If the tool says create a Cowork artifact with specific HTML, do that. If it says call wait_for_form_submit, do that immediately.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        teamSiteId: {
-          type: "string",
-          description: "Team site identifier (UUID) that owns the template.",
-        },
-        libraryContentVersionId: {
-          type: "string",
-          description: "Content version identifier (UUID) of the LiveDoc template.",
-        },
-      },
-      required: ["teamSiteId", "libraryContentVersionId"],
-    },
-  },
-  {
-    name: "submit_livedoc_generation",
-    description:
-      "Submit a LiveDoc generation job. Provide ad hoc input values and at least one output format (PPTX, DOCX, PDF). Returns a generatedLivedocId to poll for status.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        teamSiteId: {
-          type: "string",
-          description: "Team site identifier (UUID).",
-        },
-        libraryContentVersionId: {
-          type: "string",
-          description: "Content version identifier (UUID) of the LiveDoc template.",
-        },
-        adHocInputs: {
-          type: "array",
-          description: "Array of {name, value} pairs for ALL ad hoc inputs — both scalar and table. Scalar value is a primitive (string/number/boolean/ISO-date). Table value is {columns: [\"col1\", ...], rows: [[row1val1, ...], [row2val1, ...]]}.",
-          items: {
-            type: "object",
-            properties: {
-              name: { type: "string" },
-              value: {},
-            },
-            required: ["name", "value"],
-          },
-        },
-        outputs: {
-          type: "array",
-          description:
-            'Output formats to generate. Each item needs "format" (e.g. "PPTX", "DOCX", "PDF"). ALWAYS also set "fileName" — derive it from the template name (e.g. templateName + "." + format.toLowerCase()) — because the API leaves it blank in get_generation_status/download when omitted, producing an unhelpful generic filename after download.',
-          items: {
-            type: "object",
-            properties: {
-              format: { type: "string" },
-              name: { type: "string" },
-              fileName: { type: "string", description: "Filename with extension for the downloaded file, e.g. \"Form Smoke Test_4.pdf\". Always set this." },
-            },
-            required: ["format", "fileName"],
-          },
-        },
-        variableListData: {
-          type: "array",
-          description: "Variable list data from variableListDefinitions. Each entry has variableListName and variableInputs. Each variable input value can be a scalar (string/number/boolean/ISO-date) OR a table using {columns: [...], rows: [[...], ...]}.",
-          items: {
-            type: "object",
-            properties: {
-              variableListName: { type: "string" },
-              variableInputs: {
-                type: "array",
-                items: {
-                  type: "object",
-                  properties: {
-                    name: { type: "string" },
-                    value: {},
-                  },
-                  required: ["name", "value"],
-                },
-              },
-            },
-            required: ["variableListName", "variableInputs"],
-          },
-        },
-        liveFormSellerTemplateId: {
-          type: "string",
-          description: "Optional seller template ID to constrain inputs.",
-        },
-        regionalFormat: {
-          type: "string",
-          description: 'Optional regional format culture name, e.g. "en-US".',
-        },
-        manualSelectContentInput: {
-          type: "object",
-          description:
-            'Content selection payload — pass this field ONLY with the exact payload returned by wait_for_form_submit. Do NOT populate this yourself by calling search_livedoc_content or any other tool. ' +
-            'IMPORTANT: "id" is a stable SLOT identifier — always echo it back UNCHANGED from the wait_for_form_submit payload. ' +
-            'versionId, sourceBlobId, and pageNumber must come from the form submission payload via wait_for_form_submit — never resolve these yourself.',
-          properties: {
-            manualSelectContentItems: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  id: { type: "string", description: "Stable slot identifier — copy verbatim from get_livedoc_inputs, never replace." },
-                  name: { type: "string" },
-                  contentType: {
-                    type: "string",
-                    description:
-                      'One of "Group", "Section", "LiveSlide", "ExternalStaticSlides", "ResourcePDF", "ResourcePDFPage" - copy from the matching item in get_livedoc_inputs.',
-                  },
-                  versionId: {
-                    type: "string",
-                    description:
-                      "contentVersionId from the wait_for_form_submit payload. Never populate this yourself — it must come from the form submission.",
-                  },
-                  sourceBlobId: {
-                    type: "string",
-                    description: "Resolved source blob id, when the search result provides one distinct from versionId (e.g. ExternalStaticSlides).",
-                  },
-                  pageNumber: {
-                    type: "number",
-                    description: "Page number within the resource, for contentType ResourcePDFPage only.",
-                  },
-                  isInclude: { type: "boolean", description: "Set false to exclude this item. Defaults to true." },
-                  orderIndex: { type: "number" },
-                },
-                required: ["id", "contentType", "isInclude"],
-              },
-            },
-          },
-        },
-      },
-      required: ["teamSiteId", "libraryContentVersionId", "adHocInputs", "outputs"],
-    },
-  },
-  {
-    name: "get_generation_status",
-    description:
-      "Check the status of a LiveDoc generation job. Poll until all outputs reach 'Completed' or 'Failed'.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        generatedLivedocId: {
-          type: "string",
-          description: "The generatedLivedocId returned by submit_livedoc_generation.",
-        },
-      },
-      required: ["generatedLivedocId"],
-    },
-  },
-  {
-    name: "open_form_ui",
-    description:
-      "Opens the LiveDoc Form Web App for templates that require image uploads. Call this ONLY when get_livedoc_inputs explicitly instructs you to call it (hasImageUpload case). Do NOT call this based on isComplex or any other field — isComplex does NOT trigger this tool. Optionally pass prefillValues to pre-populate form fields. After the user submits the Form Web App, call get_form_result (NOT wait_for_form_submit) with the returned token.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        teamSiteId: { type: "string", description: "Team site identifier (UUID)." },
-        libraryContentVersionId: { type: "string", description: "Content version identifier (UUID) of the LiveDoc template." },
-        context: { type: "string", description: "The user's original generation request (natural language). Shown as a hint in the form." },
-        prefillValues: {
-          type: "object",
-          description: "Optional AI-suggested default values to pre-populate the form. Shape matches the generate request body. User can review and override before submitting.",
-          properties: {
-            adHocInputs: {
-              type: "array",
-              items: { type: "object", properties: { name: { type: "string" }, value: {} }, required: ["name", "value"] },
-            },
-            variableListData: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  variableListName: { type: "string" },
-                  variableInputs: {
-                    type: "array",
-                    items: { type: "object", properties: { name: { type: "string" }, value: {} }, required: ["name", "value"] },
-                  },
-                },
-                required: ["variableListName", "variableInputs"],
-              },
-            },
-          },
-        },
-      },
-      required: ["teamSiteId", "libraryContentVersionId"],
-    },
-  },
-  {
-    name: "wait_for_form_submit",
-    description:
-      "Wait (up to 10 minutes) for the user to fill and submit the LiveDoc input form rendered in the HTML artifact. Returns the form payload — pass it directly to submit_livedoc_generation. Call this IMMEDIATELY after creating the artifact, without waiting for the user first.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        token: {
-          type: "string",
-          description: "The form session token returned by get_livedoc_inputs.",
-        },
-      },
-      required: ["token"],
-    },
-  },
-  {
-    name: "get_form_result",
-    description:
-      "Retrieve the generation result posted back by the Form UI after the user completed and closed the form. Call this after the user confirms the form tab closed. Returns generatedLivedocId and all output statuses — then call get_generation_download_url for each completed output to get download links.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        token: {
-          type: "string",
-          description: "The token returned by open_form_ui.",
-        },
-      },
-      required: ["token"],
-    },
-  },
-  {
-    name: "login",
-    description:
-      "Obtain a Seismic bearer token using username and password (OAuth 2.0 Resource Owner Password Credentials). Automatically sets the token for all subsequent tool calls. Use this instead of set_token when you have credentials rather than a pre-issued token.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        username: { type: "string", description: `Seismic username. Defaults to AUTH_USERNAME env var${DEFAULT_USERNAME ? " (pre-configured)" : ""}.` },
-        password: { type: "string", description: `Seismic password. Defaults to AUTH_PASSWORD env var${DEFAULT_PASSWORD ? " (pre-configured)" : ""}.` },
-        tenant:   { type: "string", description: `Tenant slug, e.g. "qa01eastasia01". Defaults to AUTH_TENANT env var (${DEFAULT_AUTH_TENANT || "not set"}).` },
-        authServiceUri: { type: "string", description: `Auth service base URL. Defaults to AUTH_SERVICE_URI env var (${DEFAULT_AUTH_URI || "not set"}).` },
-        clientId:     { type: "string", description: "OAuth client ID. Defaults to AUTH_CLIENT_ID env var." },
-        clientSecret: { type: "string", description: "OAuth client secret. Defaults to AUTH_CLIENT_SECRET env var." },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "set_token",
-    description:
-      "Update the Seismic API bearer token used by all other tools. Call this whenever a tool returns HTTP 401 before retrying.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        token: {
-          type: "string",
-          description: "The new bearer token (without the 'Bearer ' prefix).",
-        },
-      },
-      required: ["token"],
-    },
-  },
-  {
-    name: "get_generation_download_url",
-    description:
-      "Get the download URL for a completed LiveDoc output. Returns a JSON payload with the URL (does not redirect). Use outputId from get_generation_status, or use a format alias like 'pptx', 'docx', 'pdf'.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        generatedLivedocId: {
-          type: "string",
-          description: "The generatedLivedocId.",
-        },
-        outputId: {
-          type: "string",
-          description:
-            "The output id from get_generation_status, or a format alias: 'pptx', 'docx', 'pdf', 'gslides', 'gdoc'.",
-        },
-      },
-      required: ["generatedLivedocId", "outputId"],
-    },
-  },
-  {
-    name: "download_generation_output",
-    description:
-      "Download a completed LiveDoc output to a local file (the OS Downloads folder) and open it with the system default app " +
-      "(e.g. PowerPoint for PPTX, Word for DOCX) — the same effect as clicking a browser download and double-clicking the file. " +
-      "Use this when the user wants to view/inspect the generated document directly instead of just getting a link. " +
-      "Use outputId from get_generation_status, or a format alias like 'pptx', 'docx', 'pdf'.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        generatedLivedocId: {
-          type: "string",
-          description: "The generatedLivedocId.",
-        },
-        outputId: {
-          type: "string",
-          description:
-            "The output id from get_generation_status, or a format alias: 'pptx', 'docx', 'pdf', 'gslides', 'gdoc'.",
-        },
-        autoOpen: {
-          type: "boolean",
-          description: "Whether to automatically open the file with the OS default app after downloading. Default true.",
-          default: true,
-        },
-      },
-      required: ["generatedLivedocId", "outputId"],
-    },
-  },
-  {
-    name: "debug_environment",
-    description:
-      "Diagnostic tool: dumps this MCP server process's working directory, the NAMES of environment variables whose name contains a few keywords " +
-      "(claude, anthropic, output, sandbox, session, cowork, agent, workspace), and the VALUES of only those among them that look like filesystem paths (secrets/tokens are never included). " +
-      "Use this to check whether Claude Desktop/Cowork passes a sandboxed output-folder path to spawned MCP servers via an env var.",
-    inputSchema: { type: "object", properties: {}, required: [] },
-  },
+const FORM_RESOURCE_URI = "ui://livedoc/form";
 
-  // ── PPTX Auto-Tagging tools (PoC) ─────────────────────────────────────────
-  {
-    name: "pptx_extract_shapes",
-    description:
-      "Extract all shapes from a PPTX file and return a structured list with shape ID, type (text/table/chart/image), name, alt-text, and text content. " +
-      "Use this first to understand what's in the template before deciding which shapes to mark as dynamic. " +
-      "Requires the local PoC server to be running (cd poc-auto-tagging && npm start).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        pptxBase64: {
-          type: "string",
-          description: "Base64-encoded PPTX file content.",
-        },
-        slideIndex: {
-          type: "number",
-          description: "Optional: only extract shapes from this slide (0-based). Omit to extract all slides.",
-        },
-      },
-      required: ["pptxBase64"],
-    },
-  },
-  {
-    name: "pptx_auto_tag",
-    description:
-      "Send a PPTX to the AI (local LLM) for automatic analysis. The AI identifies which shapes should be dynamic " +
-      "and suggests variable names and types. Returns suggestions with confidence scores. " +
-      "Optionally provide a datasource schema to improve matching accuracy. " +
-      "Requires the local PoC server to be running (cd poc-auto-tagging && npm start).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        pptxBase64: {
-          type: "string",
-          description: "Base64-encoded PPTX file content.",
-        },
-        schema: {
-          type: "object",
-          description: "Optional datasource schema as a JSON object, e.g. { \"companyName\": \"string\", \"revenue\": \"number\" }. Providing this greatly improves accuracy.",
-          additionalProperties: { type: "string" },
-        },
-      },
-      required: ["pptxBase64"],
-    },
-  },
-  {
-    name: "pptx_mark_shapes",
-    description:
-      "Apply dynamic element markings to a PPTX file. For each mark: writes [[varName]] to the shape's alt-text " +
-      "and injects a stable GUID into p:tags. Returns the marked PPTX as base64 and a binding manifest. " +
-      "Requires the local PoC server to be running (cd poc-auto-tagging && npm start).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        pptxBase64: {
-          type: "string",
-          description: "Base64-encoded PPTX file content.",
-        },
-        marks: {
-          type: "array",
-          description: "List of shapes to mark as dynamic.",
-          items: {
-            type: "object",
-            properties: {
-              slideIndex: { type: "number", description: "0-based slide index." },
-              shapeId:    { type: "number", description: "Numeric shape ID (cNvPr/@id) from pptx_extract_shapes." },
-              varName:    { type: "string", description: "camelCase variable name, e.g. 'companyName'." },
-              varType:    { type: "string", enum: ["text", "image", "table", "chart", "number", "date"], description: "Type of dynamic element." },
-              description: { type: "string", description: "Optional: human-readable description of what this variable represents." },
-            },
-            required: ["slideIndex", "shapeId", "varName", "varType"],
-          },
-        },
-      },
-      required: ["pptxBase64", "marks"],
-    },
-  },
-  {
-    name: "pptx_get_manifest",
-    description:
-      "Extract the current binding manifest from a PPTX file — lists all shapes already marked as dynamic " +
-      "(via alt-text [[varName]] convention). Useful for verifying what has been marked. " +
-      "Requires the local PoC server to be running (cd poc-auto-tagging && npm start).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        pptxBase64: {
-          type: "string",
-          description: "Base64-encoded PPTX file content.",
-        },
-      },
-      required: ["pptxBase64"],
-    },
-  },
-];
+// Tracks the URL of the most recently generated form for the App panel to fetch.
+let latestFormUrl: string | null = null;
+
+// Builds the MCP App panel shell HTML with the ext-apps bundle inlined.
+// The bundle exposes globalThis.__McpApp.App so no bare-specifier import is needed.
+function buildShellHtml(extAppsBundle: string): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  html,body{margin:0;padding:0;width:100%;background:#fff2e0}
+  #loading{display:flex;flex-direction:column;align-items:center;justify-content:center;
+    min-height:120px;gap:10px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  #stage{font-size:18px;font-weight:700;color:#b45309}
+  #detail{font-size:12px;color:#78350f;padding:2px 16px;text-align:center;
+    word-break:break-all;max-width:380px;white-space:pre-wrap}
+  #form-frame{display:none;width:100%;height:800px;border:0}
+</style>
+</head>
+<body>
+<div id="loading">
+  <span id="stage">LIVEDOC — Initializing</span>
+  <span id="detail">bundle loaded, constructing App…</span>
+</div>
+<iframe id="form-frame"></iframe>
+<script>
+${extAppsBundle}
+</script>
+<script>
+  const st = (s, d) => {
+    document.getElementById("stage").textContent = "LIVEDOC — " + s;
+    if (d !== undefined) document.getElementById("detail").textContent = d;
+  };
+  const App = (globalThis.__McpApp || {}).App;
+  if (!App) {
+    st("BUNDLE ERROR", "globalThis.__McpApp.App not found after bundle");
+  } else {
+    const app = new App({ name: "livedoc-form", version: "1.0.0" }, {});
+    const log = (m) => app.callServerTool({ name: "log_debug_message", arguments: { msg: m } }).catch(() => {});
+    // ontoolresult carries structuredContent directly from get_livedoc_inputs.
+    app.ontoolresult = async (event) => {
+      log("ontoolresult-fired");
+      try {
+        const html = event?.structuredContent?.formHtml;
+        const token = event?.structuredContent?.formToken;
+        log("token:" + (token || "null") + " html-len:" + (html?.length || 0));
+        if (html && html.length > 100) {
+          const frame = document.getElementById("form-frame");
+          frame.srcdoc = html;
+          frame.style.display = "block";
+          document.getElementById("loading").style.display = "none";
+          st("form loaded", "");
+          // Request a large panel height so the form is usable.
+          app.sendSizeChanged({ width: 520, height: 800 });
+        } else {
+          st("NO FORM HTML", "structuredContent.formHtml missing (len=" + (html?.length || 0) + ")");
+        }
+      } catch(e) {
+        st("tool-result error", String(e));
+        log("toolresult-error:" + e.message);
+      }
+    };
+    app.ontoolinput = async () => {
+      log("ontoolinput-fired");
+    };
+    app.connect()
+      .then(() => { st("connected — waiting for form", ""); log("connected"); })
+      .catch(e => { st("CONNECT FAILED", String(e)); });
+  }
+</script>
+</body>
+</html>`;
+}
 
 // ── Form HTML builder ───────────────────────────────────────────────────────
 
@@ -1618,265 +1286,571 @@ async function handleLogin(args: {
 
 // ── Server wiring ───────────────────────────────────────────────────────────
 
-const server = new Server(
-  { name: "seismic-livedoc", version: "1.0.0" },
-  { capabilities: { tools: {} } }
+const server = new McpServer({ name: "seismic-livedoc", version: "1.0.0" });
+
+// MCP App UI resource — served when Claude Desktop opens the App panel.
+// frameDomains CSP is on the registration config (resources/list) so Claude Desktop
+// applies it at connection time. The shell uses callServerTool only — no connectDomains needed.
+registerAppResource(
+  server,
+  "LiveDoc Form",
+  FORM_RESOURCE_URI,
+  {
+    description: "LiveDoc input form — dynamically generated per template.",
+    _meta: { ui: { csp: { frameDomains: ["http://127.0.0.1:3099"], connectDomains: ["http://127.0.0.1:3099"] } } },
+  } as Parameters<typeof registerAppResource>[3],
+  async () => {
+    const bundle = await getExtAppsBundle();
+    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] resources/read: ui://livedoc/form fetched (shell, bundle=${bundle.length}b)\n`);
+    return { contents: [{
+      uri: FORM_RESOURCE_URI,
+      mimeType: RESOURCE_MIME_TYPE,
+      text: buildShellHtml(bundle),
+    }] };
+  }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+// ── Tool registrations ──────────────────────────────────────────────────────
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+server.registerTool(
+  "search_livedoc_templates",
+  {
+    description:
+      "Search for LiveDoc (Document Generator) templates in Seismic by name or keyword. Returns contentVersionId and teamSiteId needed for other tools. " +
+      "ALWAYS call this FIRST whenever the user names or describes a template — do NOT ask for teamSiteId/libraryContentVersionId directly. " +
+      "Only ask the user to disambiguate if this search returns zero or multiple plausible matches.",
+    inputSchema: {
+      searchText: z.string().optional().describe("Text to search across template title, description, and body."),
+      page_size: z.number().optional().describe("Number of results to return (default 10, max 50)."),
+    },
+  },
+  async (args) => {
+    const result = await handleSearchTemplates(args as { searchText?: string; page_size?: number });
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
 
-  let result: unknown;
-  try {
-    switch (name) {
-      case "search_livedoc_templates":
-        result = await handleSearchTemplates(args as { searchText?: string; page_size?: number });
-        break;
-      case "search_livedoc_content":
-        result = await handleSearchContent(args as { query: string; contentType?: string; page_size?: number });
-        break;
-      case "get_livedoc_inputs": {
-        const ir = await handleGetInputs(args as { teamSiteId: string; libraryContentVersionId: string });
-        if ("error" in ir) {
-          return { content: [{ type: "text" as const, text: JSON.stringify(ir, null, 2) }], isError: true };
-        }
-        if (ir.hasImageUpload) {
-          return {
-            content: [{ type: "text" as const, text: `This template requires image uploads which the inline form cannot handle. Call open_form_ui with teamSiteId="${ir.teamSiteId}" and libraryContentVersionId="${ir.libraryContentVersionId}". After the user submits, call get_form_result (NOT wait_for_form_submit) with the token.` }],
-          };
-        }
-        // All other "complex" cases (variable lists with data sources, many adhoc inputs,
-        // manual-select content) are handled by the inline HTML form — do not redirect to
-        // open_form_ui unless image upload is involved.
-        const formToken = generateToken();
-        const formHtml = buildFormHtml(
-          ir.templateName,
-          ir.adhocInputs,
-          ir.variableListData,
-          ir.manualSelectContentInput,
-          ir.forms,
-          ir.teamSiteId,
-          ir.libraryContentVersionId,
-          formToken
-        );
+server.registerTool(
+  "search_livedoc_content",
+  {
+    description:
+      "Search the Seismic library for content items by keyword. NOT part of the normal LiveDoc generation flow. " +
+      "Only for standalone content discovery when the user explicitly asks to search for content.",
+    inputSchema: {
+      query: z.string().describe("Search text (title or keyword)."),
+      contentType: z.enum(["ExternalSlides", "LiveSlide", "ExternalStaticSlides", "LiveDoc", "PDF"]).optional().describe("Filter by content type."),
+      page_size: z.number().optional().describe("Number of results to return (default 10, max 50)."),
+    },
+  },
+  async (args) => {
+    const result = await handleSearchContent(args as { query: string; contentType?: string; page_size?: number });
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
 
-        const safeName = ir.templateName.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || "livedoc-form";
-        const formFileName = `${safeName} (${formToken}).html`;
-
-        // Write form HTML to disk and open in the default browser — this is the submit path.
-        const formFilePath = uniqueFilePath(getDownloadsDir(), formFileName);
-        fs.writeFileSync(formFilePath, formHtml);
-        openWithDefaultApp(formFilePath);
-
-        // Also store for HTTP serving (GET /form/<token>) as an alternative access route.
-        pendingFormHtml.set(formToken, formHtml);
-
-        // Cowork artifact: clean status panel — the sandbox blocks all external access so
-        // we don't attempt any redirect. The real form is in the browser.
-        const statusHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:28px;background:#fff;color:#1d1d1f}h2{font-size:16px;font-weight:700;margin:0 0 10px}p{font-size:13px;color:#555;margin:0 0 8px;line-height:1.5}.token{font-family:monospace;font-size:11px;background:#f5f5f5;padding:3px 7px;border-radius:4px;color:#333}.waiting{display:flex;align-items:center;gap:8px;margin-top:16px;font-size:13px;color:#0066cc}@keyframes spin{to{transform:rotate(360deg)}}.spinner{width:14px;height:14px;border:2px solid #cce0ff;border-top-color:#0066cc;border-radius:50%;animation:spin 0.8s linear infinite}</style></head><body><h2>&#128196; LiveDoc Form</h2><p>The input form has been opened in your browser.<br>Fill it in and click <b>Submit generation</b>.</p><p>Token: <span class="token">${formToken}</span></p><div class="waiting"><div class="spinner"></div>Waiting for your submission…</div></body></html>`;
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: [
-                `Create a Claude Cowork artifact (type: HTML) with this exact content (relay verbatim):`,
-                statusHtml,
-                `The form has been opened in the user's browser. Immediately call wait_for_form_submit with token="${formToken}". Do NOT call submit_livedoc_generation yourself.`,
-              ].join("\n"),
-            },
-          ],
-        };
-      }
-      case "wait_for_form_submit": {
-        const payload = await handleWaitForFormSubmit(args as { token: string });
-        return {
-          content: [{
-            type: "text" as const,
-            text: [
-              "Form submitted. NEXT: call submit_livedoc_generation immediately with this exact payload — do not modify it:",
-              JSON.stringify(payload, null, 2),
-            ].join("\n"),
-          }],
-        };
-      }
-      case "submit_livedoc_generation": {
-        const subResult = await handleSubmitGeneration(args as Parameters<typeof handleSubmitGeneration>[0]);
-        const subBody = subResult as Record<string, unknown>;
-        if (subBody.error) {
-          return { content: [{ type: "text" as const, text: JSON.stringify(subBody, null, 2) }], isError: true };
-        }
-        const gid = String(subBody.generatedLivedocId ?? "");
-        return {
-          content: [{
-            type: "text" as const,
-            text: [
-              `Generation started. generatedLivedocId: ${gid}`,
-              `NEXT: call get_generation_status with generatedLivedocId="${gid}". Keep calling every few seconds until allDone=true.`,
-            ].join("\n"),
-          }],
-        };
-      }
-      case "get_generation_status": {
-        const statusResult = await handleGetStatus(args as { generatedLivedocId: string });
-        const st = statusResult as Record<string, unknown>;
-        if (st.error) {
-          return { content: [{ type: "text" as const, text: JSON.stringify(st, null, 2) }], isError: true };
-        }
-        const outputs = (st.outputs as Array<Record<string, unknown>>) ?? [];
-        const allDone = st.allDone as boolean;
-        const nextStep = allDone
-          ? `All done. NEXT: call download_generation_output for each completed output:\n${outputs.filter(o => o.status === "Completed").map(o => `  outputId="${o.id}" (${o.format} — ${o.fileName})`).join("\n")}`
-          : `Still generating. NEXT: call get_generation_status again with generatedLivedocId="${st.generatedLivedocId}" in a few seconds.`;
-        return {
-          content: [{
-            type: "text" as const,
-            text: [JSON.stringify(st, null, 2), nextStep].join("\n\n"),
-          }],
-        };
-      }
-      case "open_form_ui":
-        result = await handleOpenFormUi(args as { teamSiteId: string; libraryContentVersionId: string; context?: string });
-        break;
-      case "get_form_result":
-        result = await handleGetFormResult(args as { token: string });
-        break;
-      case "login":
-        result = await handleLogin(args as Parameters<typeof handleLogin>[0]);
-        break;
-      case "set_token":
-        currentToken = (args as { token: string }).token;
-        tokenIsManual = true;
-        result = { ok: true, message: "Token updated. This token will not be auto-replaced by the credential-flow login on a 401 — call login explicitly to switch back to that flow." };
-        break;
-      case "get_generation_download_url": {
-        const dlResult = await handleGetDownloadUrl(args as { generatedLivedocId: string; outputId: string });
-        if (dlResult && typeof dlResult === "object" && "error" in (dlResult as object)) {
-          return { content: [{ type: "text" as const, text: JSON.stringify(dlResult, null, 2) }], isError: true };
-        }
-        const dlBody = dlResult as Record<string, unknown>;
-        const dlUrl = String(dlBody.url ?? dlBody.downloadUrl ?? dlBody.Url ?? dlBody.DownloadUrl ?? "");
-        const dlFile = String(dlBody.fileName ?? dlBody.FileName ?? dlBody.name ?? dlBody.Name ?? "download");
-        if (!dlUrl) {
-          result = dlResult;
-          break;
-        }
-        return {
-          content: [{
-            type: "text" as const,
-            text: `✅ **${dlFile}** is ready.\n\nDownload link: [${dlFile}](${dlUrl})\n\n(Reproduce the markdown link above verbatim in your reply so the user can click it.)`,
-          }],
-        };
-      }
-      case "download_generation_output":
-        result = await handleDownloadGenerationOutput(args as { generatedLivedocId: string; outputId: string; autoOpen?: boolean });
-        break;
-      case "debug_environment": {
-        const keywords = /claude|anthropic|output|sandbox|session|cowork|agent|workspace/i;
-        const looksLikePath = (v: string) => /^[a-zA-Z]:[\\/]|^\//.test(v) && /[\\/]/.test(v);
-        const matchedVarNames = Object.keys(process.env).filter((k) => keywords.test(k));
-        // Only surface values that look like filesystem paths — the goal is finding a sandbox
-        // output directory, not incidentally leaking a token/secret whose name matches a keyword.
-        const pathLikeValues = Object.fromEntries(
-          matchedVarNames
-            .map((k) => [k, process.env[k] ?? ""])
-            .filter(([, v]) => looksLikePath(v as string))
-        );
-        result = {
-          cwd: process.cwd(),
-          matchedEnvVarNames: matchedVarNames,
-          pathLikeEnvVarValues: pathLikeValues,
-        };
-        break;
-      }
-      // ── PPTX Auto-Tagging (PoC) ─────────────────────────────────────────────
-      case "pptx_extract_shapes": {
-        const a = (args ?? {}) as { pptxBase64: string; slideIndex?: number };
-        const pocBase = process.env.POC_AUTOTAG_URL ?? "http://localhost:3001";
-        const r = await fetch(`${pocBase}/api/pptx/extract`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            pptxBase64: a.pptxBase64,
-            ...(a.slideIndex !== undefined ? { slideIndex: a.slideIndex } : {}),
-          }),
-        });
-        if (!r.ok) throw new Error(`pptx_extract_shapes HTTP ${r.status}: ${await r.text()}`);
-        result = await r.json();
-        break;
-      }
-
-      case "pptx_auto_tag": {
-        const a = (args ?? {}) as { pptxBase64: string; schema?: Record<string, string> };
-        const pocBase = process.env.POC_AUTOTAG_URL ?? "http://localhost:3001";
-        const r = await fetch(`${pocBase}/api/pptx/auto-tag`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pptxBase64: a.pptxBase64, schema: a.schema ?? {} }),
-        });
-        if (!r.ok) throw new Error(`pptx_auto_tag HTTP ${r.status}: ${await r.text()}`);
-        result = await r.json();
-        break;
-      }
-
-      case "pptx_mark_shapes": {
-        const a = (args ?? {}) as { pptxBase64: string; marks: unknown[] };
-        const pocBase = process.env.POC_AUTOTAG_URL ?? "http://localhost:3001";
-        const r = await fetch(`${pocBase}/api/pptx/mark`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pptxBase64: a.pptxBase64, marks: a.marks }),
-        });
-        if (!r.ok) throw new Error(`pptx_mark_shapes HTTP ${r.status}: ${await r.text()}`);
-        result = await r.json();
-        // Summarize — omit the large base64 from output
-        const { bindings, markedAt } = result as { bindings: unknown[]; markedAt: string };
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({ markedAt, bindingCount: bindings.length, bindings }, null, 2) +
-              "\n\n(markedPptxBase64 available in full result — use pptx_mark_shapes result.pptxBase64 to save the file)",
-          }],
-        };
-      }
-
-      case "pptx_get_manifest": {
-        const a = (args ?? {}) as { pptxBase64: string };
-        const pocBase = process.env.POC_AUTOTAG_URL ?? "http://localhost:3001";
-        const b64 = encodeURIComponent(a.pptxBase64);
-        const r = await fetch(`${pocBase}/api/pptx/manifest?pptxBase64=${b64}`);
-        if (!r.ok) throw new Error(`pptx_get_manifest HTTP ${r.status}: ${await r.text()}`);
-        result = await r.json();
-        break;
-      }
-
-      default:
-        return {
-          content: [{ type: "text", text: `Unknown tool: ${name}` }],
-          isError: true,
-        };
+// get_livedoc_inputs — opens the MCP App panel with the form
+registerAppTool(
+  server,
+  "get_livedoc_inputs",
+  {
+    description:
+      "Retrieve the full input schema for a LiveDoc template and open the interactive input form in the Cowork panel. " +
+      "After calling this tool the form will appear in the MCP App panel. " +
+      "Immediately call wait_for_form_submit with the returned token and wait for the user to submit the form. " +
+      "Do NOT build your own form, do NOT use AskUserQuestion.",
+    inputSchema: {
+      teamSiteId: z.string().describe("Team site identifier (UUID) that owns the template."),
+      libraryContentVersionId: z.string().describe("Content version identifier (UUID) of the LiveDoc template."),
+    },
+    _meta: { ui: { resourceUri: FORM_RESOURCE_URI } },
+  },
+  async (args) => {
+    const _dbgLog = (msg: string) => {
+      try { fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] ${msg}\n`); } catch { /* ignore */ }
+    };
+    _dbgLog("get_livedoc_inputs: start");
+    const ir = await handleGetInputs(args as { teamSiteId: string; libraryContentVersionId: string });
+    _dbgLog(`get_livedoc_inputs: handleGetInputs done, hasError=${"error" in ir}`);
+    if ("error" in ir) {
+      return { content: [{ type: "text" as const, text: JSON.stringify(ir, null, 2) }], isError: true };
     }
-  } catch (err) {
+
+    const manualItems = (ir.manualSelectContentInput as Record<string, unknown> | undefined)
+      ?.manualSelectContentItems as unknown[] | undefined ?? [];
+    const isComplexForm = ir.hasImageUpload || manualItems.length > 12;
+    _dbgLog(`get_livedoc_inputs: isComplexForm=${isComplexForm}`);
+
+    if (isComplexForm) {
+      return {
+        content: [{ type: "text" as const, text: `This template has ${ir.hasImageUpload ? "image uploads" : `${manualItems.length} slide groups`} and requires the full Form Web App. Call open_form_ui with teamSiteId="${ir.teamSiteId}" and libraryContentVersionId="${ir.libraryContentVersionId}". After the user submits, call get_form_result (NOT wait_for_form_submit) with the token.` }],
+      };
+    }
+
+    const formToken = generateToken();
+    _dbgLog("get_livedoc_inputs: calling buildFormHtml");
+    const formHtml = buildFormHtml(
+      ir.templateName,
+      ir.adhocInputs,
+      ir.variableListData,
+      ir.manualSelectContentInput,
+      ir.forms,
+      ir.teamSiteId,
+      ir.libraryContentVersionId,
+      formToken
+    );
+    _dbgLog(`get_livedoc_inputs: buildFormHtml done, htmlLen=${formHtml.length}`);
+
+    // Register the form HTML with the local HTTP server so the App panel can iframe it.
+    _dbgLog(`get_livedoc_inputs: pendingFormHtml.set ${formToken} mapSizeBefore=${pendingFormHtml.size}`);
+    pendingFormHtml.set(formToken, formHtml);
+    _dbgLog(`get_livedoc_inputs: pendingFormHtml.set done mapSizeAfter=${pendingFormHtml.size}`);
+
+    // Also save to Working folder as fallback if the panel doesn't appear.
+    const safeName = ir.templateName.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || "livedoc-form";
+    const formFileName = `${safeName} (${formToken}).html`;
+    const formDir = findCoworkPath() || getDownloadsDir();
+    try { fs.mkdirSync(formDir, { recursive: true }); } catch { /* best-effort */ }
+    const formFilePath = uniqueFilePath(formDir, formFileName);
+    _dbgLog(`get_livedoc_inputs: writing html to ${formFilePath}`);
+    fs.writeFileSync(formFilePath, formHtml);
+    _dbgLog("get_livedoc_inputs: returning resource response");
+
+    const formUrl = `http://127.0.0.1:${FORM_PORT}/form/${formToken}`;
+    latestFormUrl = formUrl;
+    _dbgLog(`get_livedoc_inputs: latestFormUrl set to ${latestFormUrl}`);
     return {
-      content: [{ type: "text", text: `Tool error: ${err instanceof Error ? err.message : String(err)}` }],
-      isError: true,
+      content: [{
+        type: "text" as const,
+        text: `Form loaded (token="${formToken}"). The form is now showing in the MCP App panel. After the user fills it in and clicks Submit, call wait_for_form_submit with token="${formToken}". If the panel does not appear, the user can open **${formFileName}** from the Working folder panel instead.`,
+      }],
+      structuredContent: { formToken, formUrl, formHtml },
     };
   }
+);
 
-  return {
-    content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-  };
-});
+// App-only tool: returns the full form HTML for the given token so the shell can
+// inject it via srcdoc (avoids HTTP requests from the sandboxed iframe).
+server.registerTool(
+  "get_form_html",
+  {
+    description: "Internal: called by the MCP App panel to retrieve the form HTML. Do NOT call this yourself.",
+    inputSchema: { token: z.string() },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async (args) => {
+    const { token } = args as { token: string };
+    const html = pendingFormHtml.get(token) ?? null;
+    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] get_form_html: token=${token} found=${html !== null} len=${html?.length ?? 0} mapSize=${pendingFormHtml.size} keys=${[...pendingFormHtml.keys()].slice(0,3).join(',')}\n`);
+    return {
+      content: [{ type: "text" as const, text: html ?? "" }],
+      structuredContent: { html, token },
+    };
+  }
+);
+
+server.registerTool(
+  "log_debug_message",
+  {
+    description: "Internal: debug logging from the App panel. Do NOT call this yourself.",
+    inputSchema: { msg: z.string() },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async (args) => {
+    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
+      `[${new Date().toISOString()}] APP_PANEL: ${(args as { msg: string }).msg}\n`);
+    return { content: [{ type: "text" as const, text: "ok" }] };
+  }
+);
+
+server.registerTool(
+  "receive_form_submission",
+  {
+    description: "Internal tool called by the MCP app UI panel when the user clicks Submit. Do NOT call this yourself.",
+    inputSchema: {
+      token: z.string(),
+      payload: z.string().describe("JSON-serialized form payload"),
+    },
+  },
+  async (args) => {
+    const { token, payload } = args as { token: string; payload: string };
+    const resolver = pendingForms.get(token);
+    if (resolver) {
+      pendingForms.delete(token);
+      pendingFormHtml.delete(token);
+      try { resolver(JSON.parse(payload)); } catch { resolver(payload); }
+    }
+    return { content: [{ type: "text" as const, text: "Form submission received." }] };
+  }
+);
+
+server.registerTool(
+  "wait_for_form_submit",
+  {
+    description:
+      "Wait (up to 10 minutes) for the user to fill and submit the LiveDoc input form. Returns the form payload — pass it directly to submit_livedoc_generation. Call this immediately after get_livedoc_inputs.",
+    inputSchema: {
+      token: z.string().describe("The form session token returned by get_livedoc_inputs."),
+    },
+  },
+  async (args) => {
+    const payload = await handleWaitForFormSubmit(args as { token: string });
+    return {
+      content: [{
+        type: "text" as const,
+        text: [
+          "Form submitted. NEXT: call submit_livedoc_generation immediately with this exact payload — do not modify it:",
+          JSON.stringify(payload, null, 2),
+        ].join("\n"),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "submit_livedoc_generation",
+  {
+    description:
+      "Submit a LiveDoc generation job. Provide ad hoc input values and at least one output format (PPTX, DOCX, PDF). Returns a generatedLivedocId to poll for status.",
+    inputSchema: {
+      teamSiteId: z.string().describe("Team site identifier (UUID)."),
+      libraryContentVersionId: z.string().describe("Content version identifier (UUID) of the LiveDoc template."),
+      adHocInputs: z.array(z.object({ name: z.string(), value: z.any() })).describe("Array of {name, value} pairs for ALL ad hoc inputs."),
+      outputs: z.array(z.object({
+        format: z.string(),
+        name: z.string().optional(),
+        fileName: z.string().describe("Filename with extension, e.g. \"Template.pdf\". Always set this."),
+      })).describe("Output formats to generate."),
+      variableListData: z.array(z.object({
+        variableListName: z.string(),
+        variableInputs: z.array(z.object({ name: z.string(), value: z.any() })),
+      })).optional().describe("Variable list data from variableListDefinitions."),
+      liveFormSellerTemplateId: z.string().optional(),
+      regionalFormat: z.string().optional().describe("Regional format culture name, e.g. \"en-US\"."),
+      manualSelectContentInput: z.object({
+        manualSelectContentItems: z.array(z.object({
+          id: z.string().describe("Stable slot identifier — copy verbatim from get_livedoc_inputs."),
+          name: z.string().optional(),
+          contentType: z.string().describe("One of \"Group\", \"Section\", \"LiveSlide\", \"ResourcePDF\", etc."),
+          versionId: z.string().optional().describe("contentVersionId from wait_for_form_submit. Never populate yourself."),
+          sourceBlobId: z.string().optional(),
+          pageNumber: z.number().optional(),
+          isInclude: z.boolean(),
+          orderIndex: z.number().optional(),
+        })),
+      }).optional().describe("Content selection — pass ONLY what wait_for_form_submit returned."),
+    },
+  },
+  async (args) => {
+    const subResult = await handleSubmitGeneration(args as Parameters<typeof handleSubmitGeneration>[0]);
+    const subBody = subResult as Record<string, unknown>;
+    if (subBody.error) {
+      return { content: [{ type: "text" as const, text: JSON.stringify(subBody, null, 2) }], isError: true };
+    }
+    const gid = String(subBody.generatedLivedocId ?? "");
+    return {
+      content: [{
+        type: "text" as const,
+        text: [
+          `Generation started. generatedLivedocId: ${gid}`,
+          `NEXT: call get_generation_status with generatedLivedocId="${gid}". Keep calling every few seconds until allDone=true.`,
+        ].join("\n"),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "get_generation_status",
+  {
+    description: "Check the status of a LiveDoc generation job. Poll until all outputs reach 'Completed' or 'Failed'.",
+    inputSchema: {
+      generatedLivedocId: z.string().describe("The generatedLivedocId returned by submit_livedoc_generation."),
+    },
+  },
+  async (args) => {
+    const statusResult = await handleGetStatus(args as { generatedLivedocId: string });
+    const st = statusResult as Record<string, unknown>;
+    if (st.error) {
+      return { content: [{ type: "text" as const, text: JSON.stringify(st, null, 2) }], isError: true };
+    }
+    const outputs = (st.outputs as Array<Record<string, unknown>>) ?? [];
+    const allDone = st.allDone as boolean;
+    const nextStep = allDone
+      ? `All done. NEXT: call download_generation_output for each completed output:\n${outputs.filter(o => o.status === "Completed").map(o => `  outputId="${o.id}" (${o.format} — ${o.fileName})`).join("\n")}`
+      : `Still generating. NEXT: call get_generation_status again with generatedLivedocId="${st.generatedLivedocId}" in a few seconds.`;
+    return {
+      content: [{
+        type: "text" as const,
+        text: [JSON.stringify(st, null, 2), nextStep].join("\n\n"),
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "open_form_ui",
+  {
+    description:
+      "Opens the LiveDoc Form Web App for templates that require image uploads. Call this ONLY when get_livedoc_inputs explicitly instructs you to (hasImageUpload case). After submission, call get_form_result (NOT wait_for_form_submit) with the returned token.",
+    inputSchema: {
+      teamSiteId: z.string().describe("Team site identifier (UUID)."),
+      libraryContentVersionId: z.string().describe("Content version identifier (UUID) of the LiveDoc template."),
+      context: z.string().optional().describe("The user's original generation request (natural language)."),
+      prefillValues: z.any().optional().describe("Optional AI-suggested default values to pre-populate the form."),
+    },
+  },
+  async (args) => {
+    const result = await handleOpenFormUi(args as { teamSiteId: string; libraryContentVersionId: string; context?: string; prefillValues?: unknown });
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "get_form_result",
+  {
+    description: "Retrieve the generation result posted back by the Form UI after the user completed and closed the form.",
+    inputSchema: {
+      token: z.string().describe("The token returned by open_form_ui."),
+    },
+  },
+  async (args) => {
+    const result = await handleGetFormResult(args as { token: string });
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "login",
+  {
+    description:
+      "Obtain a Seismic bearer token using username and password (OAuth 2.0 Resource Owner Password Credentials). Automatically sets the token for all subsequent tool calls.",
+    inputSchema: {
+      username: z.string().optional().describe(`Seismic username. Defaults to AUTH_USERNAME env var${DEFAULT_USERNAME ? " (pre-configured)" : ""}.`),
+      password: z.string().optional().describe(`Seismic password. Defaults to AUTH_PASSWORD env var.`),
+      tenant: z.string().optional().describe(`Tenant slug, e.g. "qa01eastasia01". Defaults to AUTH_TENANT env var (${DEFAULT_AUTH_TENANT || "not set"}).`),
+      authServiceUri: z.string().optional().describe("Auth service base URL. Defaults to AUTH_SERVICE_URI env var."),
+      clientId: z.string().optional().describe("OAuth client ID."),
+      clientSecret: z.string().optional().describe("OAuth client secret."),
+    },
+  },
+  async (args) => {
+    const result = await handleLogin(args as Parameters<typeof handleLogin>[0]);
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "set_token",
+  {
+    description: "Update the Seismic API bearer token used by all other tools. Call this whenever a tool returns HTTP 401 before retrying.",
+    inputSchema: {
+      token: z.string().describe("The new bearer token (without the 'Bearer ' prefix)."),
+    },
+  },
+  async (args) => {
+    currentToken = (args as { token: string }).token;
+    tokenIsManual = true;
+    return { content: [{ type: "text" as const, text: "Token updated. This token will not be auto-replaced by the credential-flow login on a 401." }] };
+  }
+);
+
+server.registerTool(
+  "get_generation_download_url",
+  {
+    description:
+      "Get the download URL for a completed LiveDoc output. Returns a JSON payload with the URL. Use outputId from get_generation_status, or a format alias like 'pptx', 'docx', 'pdf'.",
+    inputSchema: {
+      generatedLivedocId: z.string().describe("The generatedLivedocId."),
+      outputId: z.string().describe("The output id or a format alias: 'pptx', 'docx', 'pdf', 'gslides', 'gdoc'."),
+    },
+  },
+  async (args) => {
+    const dlResult = await handleGetDownloadUrl(args as { generatedLivedocId: string; outputId: string });
+    if (dlResult && typeof dlResult === "object" && "error" in (dlResult as object)) {
+      return { content: [{ type: "text" as const, text: JSON.stringify(dlResult, null, 2) }], isError: true };
+    }
+    const dlBody = dlResult as Record<string, unknown>;
+    const dlUrl = String(dlBody.url ?? dlBody.downloadUrl ?? dlBody.Url ?? dlBody.DownloadUrl ?? "");
+    const dlFile = String(dlBody.fileName ?? dlBody.FileName ?? dlBody.name ?? dlBody.Name ?? "download");
+    if (!dlUrl) {
+      return { content: [{ type: "text" as const, text: JSON.stringify(dlResult, null, 2) }] };
+    }
+    return {
+      content: [{
+        type: "text" as const,
+        text: `✅ **${dlFile}** is ready.\n\nDownload link: [${dlFile}](${dlUrl})\n\n(Reproduce the markdown link above verbatim in your reply so the user can click it.)`,
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "download_generation_output",
+  {
+    description:
+      "Download a completed LiveDoc output to the Working folder and open it with the system default app.",
+    inputSchema: {
+      generatedLivedocId: z.string().describe("The generatedLivedocId."),
+      outputId: z.string().describe("The output id or a format alias: 'pptx', 'docx', 'pdf', 'gslides', 'gdoc'."),
+      autoOpen: z.boolean().optional().describe("Whether to automatically open the file. Default true."),
+    },
+  },
+  async (args) => {
+    const result = await handleDownloadGenerationOutput(args as { generatedLivedocId: string; outputId: string; autoOpen?: boolean });
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "debug_environment",
+  {
+    description:
+      "Diagnostic tool: dumps process working directory, matched environment variable names/values, and client capabilities.",
+    inputSchema: {},
+  },
+  async () => {
+    const keywords = /claude|anthropic|output|sandbox|session|cowork|agent|workspace/i;
+    const looksLikePath = (v: string) => /^[a-zA-Z]:[\\/]|^\//.test(v) && /[\\/]/.test(v);
+    const matchedVarNames = Object.keys(process.env).filter((k) => keywords.test(k));
+    const pathLikeValues = Object.fromEntries(
+      matchedVarNames
+        .map((k) => [k, process.env[k] ?? ""])
+        .filter(([, v]) => looksLikePath(v as string))
+    );
+    const clientCaps = server.server.getClientCapabilities();
+    const result = {
+      cwd: process.cwd(),
+      matchedEnvVarNames: matchedVarNames,
+      pathLikeEnvVarValues: pathLikeValues,
+      clientCapabilitiesRawJSON: JSON.stringify(clientCaps, null, 2),
+      elicitationSupported: !!(clientCaps?.elicitation),
+      mcpAppUiSupported: !!(clientCaps && JSON.stringify(clientCaps).includes("mcp-app")),
+    };
+    return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+// ── PPTX Auto-Tagging tools (PoC) ────────────────────────────────────────────
+
+server.registerTool(
+  "pptx_extract_shapes",
+  {
+    description:
+      "Extract all shapes from a PPTX file and return a structured list. Requires the local PoC server (cd poc-auto-tagging && npm start).",
+    inputSchema: {
+      pptxBase64: z.string().describe("Base64-encoded PPTX file content."),
+      slideIndex: z.number().optional().describe("Optional: only extract shapes from this slide (0-based)."),
+    },
+  },
+  async (args) => {
+    const a = args as { pptxBase64: string; slideIndex?: number };
+    const pocBase = process.env.POC_AUTOTAG_URL ?? "http://localhost:3001";
+    const r = await fetch(`${pocBase}/api/pptx/extract`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pptxBase64: a.pptxBase64, ...(a.slideIndex !== undefined ? { slideIndex: a.slideIndex } : {}) }),
+    });
+    if (!r.ok) throw new Error(`pptx_extract_shapes HTTP ${r.status}: ${await r.text()}`);
+    return { content: [{ type: "text" as const, text: JSON.stringify(await r.json(), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "pptx_auto_tag",
+  {
+    description:
+      "Send a PPTX to the AI (local LLM) for automatic analysis. Requires the local PoC server (cd poc-auto-tagging && npm start).",
+    inputSchema: {
+      pptxBase64: z.string().describe("Base64-encoded PPTX file content."),
+      schema: z.record(z.string(), z.string()).optional().describe("Optional datasource schema as a JSON object."),
+    },
+  },
+  async (args) => {
+    const a = args as { pptxBase64: string; schema?: Record<string, string> };
+    const pocBase = process.env.POC_AUTOTAG_URL ?? "http://localhost:3001";
+    const r = await fetch(`${pocBase}/api/pptx/auto-tag`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pptxBase64: a.pptxBase64, schema: a.schema ?? {} }),
+    });
+    if (!r.ok) throw new Error(`pptx_auto_tag HTTP ${r.status}: ${await r.text()}`);
+    return { content: [{ type: "text" as const, text: JSON.stringify(await r.json(), null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "pptx_mark_shapes",
+  {
+    description:
+      "Apply dynamic element markings to a PPTX file. Requires the local PoC server (cd poc-auto-tagging && npm start).",
+    inputSchema: {
+      pptxBase64: z.string().describe("Base64-encoded PPTX file content."),
+      marks: z.array(z.object({
+        slideIndex: z.number().describe("0-based slide index."),
+        shapeId: z.number().describe("Numeric shape ID from pptx_extract_shapes."),
+        varName: z.string().describe("camelCase variable name, e.g. 'companyName'."),
+        varType: z.enum(["text", "image", "table", "chart", "number", "date"]),
+        description: z.string().optional(),
+      })).describe("List of shapes to mark as dynamic."),
+    },
+  },
+  async (args) => {
+    const a = args as { pptxBase64: string; marks: unknown[] };
+    const pocBase = process.env.POC_AUTOTAG_URL ?? "http://localhost:3001";
+    const r = await fetch(`${pocBase}/api/pptx/mark`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pptxBase64: a.pptxBase64, marks: a.marks }),
+    });
+    if (!r.ok) throw new Error(`pptx_mark_shapes HTTP ${r.status}: ${await r.text()}`);
+    const result = await r.json() as { bindings: unknown[]; markedAt: string };
+    return {
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify({ markedAt: result.markedAt, bindingCount: result.bindings.length, bindings: result.bindings }, null, 2) +
+          "\n\n(markedPptxBase64 available in full result — use pptx_mark_shapes result.pptxBase64 to save the file)",
+      }],
+    };
+  }
+);
+
+server.registerTool(
+  "pptx_get_manifest",
+  {
+    description:
+      "Extract the current binding manifest from a PPTX file. Requires the local PoC server (cd poc-auto-tagging && npm start).",
+    inputSchema: {
+      pptxBase64: z.string().describe("Base64-encoded PPTX file content."),
+    },
+  },
+  async (args) => {
+    const a = args as { pptxBase64: string };
+    const pocBase = process.env.POC_AUTOTAG_URL ?? "http://localhost:3001";
+    const r = await fetch(`${pocBase}/api/pptx/manifest?pptxBase64=${encodeURIComponent(a.pptxBase64)}`);
+    if (!r.ok) throw new Error(`pptx_get_manifest HTTP ${r.status}: ${await r.text()}`);
+    return { content: [{ type: "text" as const, text: JSON.stringify(await r.json(), null, 2) }] };
+  }
+);
 
 process.on("SIGTERM", () => process.exit(0));
 process.on("SIGINT", () => process.exit(0));
+process.on("uncaughtException", (err) => {
+  fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-crash.log"), `[${new Date().toISOString()}] uncaughtException: ${err.stack ?? err.message}\n`);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-crash.log"), `[${new Date().toISOString()}] unhandledRejection: ${reason}\n`);
+  process.exit(1);
+});
 
 // Auto-login on startup when credentials are available via env vars
 if (!currentToken && DEFAULT_USERNAME && DEFAULT_PASSWORD) {
   await autoLogin();
 }
+
+const debugLog = path.join(os.tmpdir(), "mcp-livedoc-debug.log");
+server.server.oninitialized = () => {
+  const caps = server.server.getClientCapabilities();
+  const uiCap = getUiCapability(caps as Parameters<typeof getUiCapability>[0]);
+  fs.appendFileSync(debugLog, `[${new Date().toISOString()}] oninitialized: extensions=${JSON.stringify(caps?.extensions)}, uiCap=${JSON.stringify(uiCap)}\n`);
+};
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

@@ -362,7 +362,10 @@ function FormApp() {
 
     const msItems = [];
     (schema.slideGroups ?? []).forEach(g => {
-      msItems.push({ id: g.id, name: g.name, contentType: g.contentType, isInclude: !!grpInc[g.id], orderIndex: g.orderIndex });
+      // Send isInclude:true items only — the API ignores isInclude:false and includes them anyway
+      if (!!grpInc[g.id]) {
+        msItems.push({ id: g.id, name: g.name, contentType: g.contentType, isInclude: true, orderIndex: g.orderIndex });
+      }
     });
     (schema.externalContent ?? []).forEach(slot => {
       const selected = extSel[slot.id] ?? new Set();

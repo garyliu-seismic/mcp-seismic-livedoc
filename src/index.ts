@@ -1,10 +1,8 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerAppTool, registerAppResource, RESOURCE_MIME_TYPE, getUiCapability } from "@modelcontextprotocol/ext-apps/server";
-import { build } from "esbuild";
 import { z } from "zod";
-import * as http from "http";
 import { randomUUID } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
@@ -12,36 +10,6 @@ import * as os from "os";
 import { exec } from "child_process";
 import { fileURLToPath } from "url";
 
-// Bundle @modelcontextprotocol/ext-apps (App class + deps) into a browser IIFE at startup.
-// This avoids relying on Claude Desktop to inject an import map for bare specifiers.
-let _extAppsBundleCache: string | null = null;
-async function getExtAppsBundle(): Promise<string> {
-  if (_extAppsBundleCache !== null) return _extAppsBundleCache;
-  try {
-    // resolveDir must be the package root (parent of node_modules).
-    // dist/index.js → dist/ → package root; src/index.ts → src/ → package root.
-    const pkgRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-    const result = await build({
-      stdin: {
-        contents: `import { App } from "@modelcontextprotocol/ext-apps"; globalThis.__McpApp = { App };`,
-        resolveDir: pkgRoot,
-      },
-      bundle: true,
-      format: "iife",
-      write: false,
-      platform: "browser",
-      logLevel: "silent",
-    });
-    _extAppsBundleCache = Buffer.from(result.outputFiles[0].contents).toString("utf-8");
-    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
-      `[${new Date().toISOString()}] ext-apps bundle: ${_extAppsBundleCache.length} bytes OK\n`);
-  } catch (e) {
-    _extAppsBundleCache = `console.error("[livedoc] ext-apps bundle failed:", ${JSON.stringify(String(e))});`;
-    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
-      `[${new Date().toISOString()}] ext-apps bundle FAILED: ${e}\n`);
-  }
-  return _extAppsBundleCache;
-}
 
 // Reads coworkUserFilesPath from the Claude Desktop config JSON.
 // Tries the standard %APPDATA%\Claude path first, then the Microsoft Store
@@ -82,68 +50,8 @@ const DEFAULT_CLIENT_SECRET = process.env.AUTH_CLIENT_SECRET  ?? "";
 const DEFAULT_USERNAME      = process.env.AUTH_USERNAME        ?? "";
 const DEFAULT_PASSWORD      = process.env.AUTH_PASSWORD        ?? "";
 
-// ── Tiny HTTP server for artifact form submissions ──────────────────────────
-const FORM_PORT = 3099;
-const pendingForms = new Map<string, (payload: unknown) => void>();
-const pendingFormHtml = new Map<string, string>(); // token → full HTML, served via GET /form/<token>
-// Submissions that arrived before wait_for_form_submit was called (race-condition buffer).
-const preReceivedPayloads = new Map<string, unknown>();
-
-const formHttpServer = http.createServer((req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-
-  // Debug ping: GET /ping/<message> — logs from the App panel iframe for diagnostics.
-  const pingMatch = req.url?.match(/^\/ping\/(.+)/);
-  if (req.method === "GET" && pingMatch) {
-    const msg = decodeURIComponent(pingMatch[1]);
-    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] APP_PANEL: ${msg}\n`);
-    res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok");
-    return;
-  }
-
-  // Serve form HTML so a small <iframe> wrapper can load it inside Claude Cowork.
-  const getForm = req.url?.match(/^\/form\/([^/?]+)/);
-  if (req.method === "GET" && getForm) {
-    const html = pendingFormHtml.get(getForm[1]);
-    fs.appendFileSync(require("path").join(require("os").tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] HTTP GET /form/${getForm[1]}: found=${html !== undefined}\n`);
-    if (html) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(html);
-    } else {
-      res.writeHead(404); res.end("Form not found or expired");
-    }
-    return;
-  }
-
-  const m = req.url?.match(/^\/submit\/([^/?]+)/);
-  if (req.method === "POST" && m) {
-    const token = m[1];
-    let body = "";
-    req.on("data", (chunk: Buffer) => { body += chunk; });
-    req.on("end", () => {
-      const resolver = pendingForms.get(token);
-      fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] HTTP_SUBMIT pid=${process.pid} token=${token} resolverFound=${!!resolver} pendingSize=${pendingForms.size} preSize=${preReceivedPayloads.size}\n`);
-      if (resolver) {
-        pendingForms.delete(token);
-        pendingFormHtml.delete(token); // clean up served HTML
-        try { resolver(JSON.parse(body)); } catch { resolver(body); }
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(`<!DOCTYPE html><html><head><title>Submitted</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f0fdf4}div{text-align:center;color:#166534}</style></head><body><div><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="#16a34a" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg><h2>Form submitted!</h2><p>Claude is now generating your document.</p></div></body></html>`);
-      } else {
-        // wait_for_form_submit not called yet — buffer the payload so it can pick it up immediately when called.
-        try { preReceivedPayloads.set(token, JSON.parse(body)); } catch { preReceivedPayloads.set(token, body); }
-        res.writeHead(200, { "Content-Type": "text/plain" }); res.end("buffered");
-      }
-    });
-  } else {
-    res.writeHead(404); res.end();
-  }
-});
-formHttpServer.listen(FORM_PORT, "127.0.0.1");
-formHttpServer.on("error", () => { /* port in use — form falls back to copy-paste */ });
+const pendingFormSchemas  = new Map<string, unknown>(); // token → normalised form schema for get_form_schema
+const pendingGenerations  = new Map<string, string>();  // generatedLivedocId → formToken (Process 2 only)
 
 let currentToken = process.env.SEISMIC_API_TOKEN ?? "";
 // True once a token was explicitly provided via set_token — disables the silent
@@ -237,479 +145,6 @@ function isComplex(resp: Record<string, unknown>): boolean {
 // ── Tool definitions ────────────────────────────────────────────────────────
 
 const FORM_RESOURCE_URI = "ui://livedoc/form";
-
-// Tracks the URL of the most recently generated form for the App panel to fetch.
-let latestFormUrl: string | null = null;
-
-// Builds the MCP App panel shell HTML with the ext-apps bundle inlined.
-// The bundle exposes globalThis.__McpApp.App so no bare-specifier import is needed.
-function buildShellHtml(extAppsBundle: string): string {
-  return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<style>
-  html,body{margin:0;padding:0;width:100%;background:#fff2e0}
-  #loading{display:flex;flex-direction:column;align-items:center;justify-content:center;
-    min-height:120px;gap:10px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-  #stage{font-size:18px;font-weight:700;color:#b45309}
-  #detail{font-size:12px;color:#78350f;padding:2px 16px;text-align:center;
-    word-break:break-all;max-width:380px;white-space:pre-wrap}
-  #form-frame{display:none;width:100%;height:800px;border:0}
-</style>
-</head>
-<body>
-<div id="loading">
-  <span id="stage">LIVEDOC — Initializing</span>
-  <span id="detail">bundle loaded, constructing App…</span>
-</div>
-<iframe id="form-frame"></iframe>
-<script>
-${extAppsBundle}
-</script>
-<script>
-  const st = (s, d) => {
-    document.getElementById("stage").textContent = "LIVEDOC — " + s;
-    if (d !== undefined) document.getElementById("detail").textContent = d;
-  };
-  const App = (globalThis.__McpApp || {}).App;
-  if (!App) {
-    st("BUNDLE ERROR", "globalThis.__McpApp.App not found after bundle");
-  } else {
-    const app = new App({ name: "livedoc-form", version: "1.0.0" }, {});
-    const log = (m) => app.callServerTool({ name: "log_debug_message", arguments: { msg: m } }).catch(() => {});
-    // ontoolresult carries structuredContent directly from get_livedoc_inputs.
-    app.ontoolresult = async (event) => {
-      log("ontoolresult-fired");
-      try {
-        const html = event?.structuredContent?.formHtml;
-        const token = event?.structuredContent?.formToken;
-        log("token:" + (token || "null") + " html-len:" + (html?.length || 0));
-        if (html && html.length > 100) {
-          const frame = document.getElementById("form-frame");
-          frame.srcdoc = html;
-          frame.style.display = "block";
-          document.getElementById("loading").style.display = "none";
-          st("form loaded", "");
-          // Request a large panel height so the form is usable.
-          app.sendSizeChanged({ width: 520, height: 800 });
-        } else {
-          st("NO FORM HTML", "structuredContent.formHtml missing (len=" + (html?.length || 0) + ")");
-        }
-      } catch(e) {
-        st("tool-result error", String(e));
-        log("toolresult-error:" + e.message);
-      }
-    };
-    app.ontoolinput = async () => {
-      log("ontoolinput-fired");
-    };
-    // Relay form submissions from the srcdoc iframe to the MCP server via callServerTool.
-    // The MCP tool handler makes a server-side HTTP POST to port 3099 (no browser CSP applies).
-    window.addEventListener("message", async (e) => {
-      if (!e.data || e.data.type !== "livedoc-submit") return;
-      const { token, payload } = e.data;
-      log("form-submit-relay token=" + token);
-      try {
-        await app.callServerTool({ name: "receive_form_submission", arguments: { token, payload } });
-        log("form-submit-relay ok");
-      } catch(err) {
-        log("form-submit-relay error:" + err.message);
-      }
-    });
-    app.connect()
-      .then(() => { st("connected — waiting for form", ""); log("connected"); })
-      .catch(e => { st("CONNECT FAILED", String(e)); });
-  }
-</script>
-</body>
-</html>`;
-}
-
-// ── Form HTML builder ───────────────────────────────────────────────────────
-
-function esc(s: string): string {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function gf(o: Record<string, unknown>, key: string): unknown {
-  return o[key] ?? o[key[0].toUpperCase() + key.slice(1)];
-}
-
-function typeLabel(type: string): string {
-  switch (type.toUpperCase()) {
-    case "STRING":  return " (string)";
-    case "INTEGER": return " (integer)";
-    case "FLOAT":   return " (float)";
-    case "DATE":    return " (date)";
-    case "BOOL": case "BOOLEAN": return " (boolean)";
-    default: return "";
-  }
-}
-
-function scalarInput(name: string, type: string, scope: string, vlName?: string): string {
-  const t = type.toUpperCase();
-  const id = "f-" + name.replace(/[^a-zA-Z0-9]/g, "_");
-  const vlAttr = vlName ? ` data-vl-name="${esc(vlName)}"` : "";
-  const label = esc(name) + typeLabel(t);
-  if (t === "BOOL" || t === "BOOLEAN") {
-    return `<div class="bool-field"><input type="checkbox" id="${id}" data-scope="${scope}" data-field-name="${esc(name)}" data-field-type="${esc(t)}"${vlAttr}><label for="${id}">${label}</label></div>`;
-  }
-  const itype = t === "DATE" ? "date" : (t === "INTEGER" || t === "FLOAT") ? "number" : "text";
-  const step = t === "FLOAT" ? ` step="any"` : t === "INTEGER" ? ` step="1"` : "";
-  return `<div class="fw"><label class="fl" for="${id}">${label}</label><input type="${itype}"${step} id="${id}" class="fi" data-scope="${scope}" data-field-name="${esc(name)}" data-field-type="${esc(t)}"${vlAttr} placeholder="${esc(name)}"></div>`;
-}
-
-function tableInput(name: string, columns: Array<Record<string, unknown>>, scope: string, vlName?: string): string {
-  const tid = "tbl-" + name.replace(/[^a-zA-Z0-9]/g, "_");
-  const colDefs = columns.map(c => ({ name: String(gf(c, "name") ?? ""), type: String(gf(c, "type") ?? "STRING") }));
-  const colsAttr = esc(JSON.stringify(colDefs));
-  const vlAttr = vlName ? ` data-vl-name="${esc(vlName)}"` : "";
-  const ths = colDefs.map(c => `<th>${esc(c.name)}</th>`).join("") + `<th style="width:32px"></th>`;
-  return `<div class="tbl-wrap"><div class="sl">${esc(name)}</div><table class="dt" data-table-id="${tid}" data-table-scope="${scope}" data-table-name="${esc(name)}"${vlAttr} data-cols="${colsAttr}"><thead><tr>${ths}</tr></thead><tbody id="${tid}-body"></tbody></table><button class="add-btn" onclick="addRow('${tid}')">+ Add row</button></div>`;
-}
-
-function contentTypeIconSvg(contentType: string): string {
-  const t = (contentType ?? "").toLowerCase();
-  const svg = (body: string) => `<svg class="ct-icon" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">${body}</svg>`;
-  if (t === "group") {
-    // Folder
-    return svg(`<path fill="#f59e0b" d="M1 3.5A1.5 1.5 0 012.5 2H6l1.5 2H13.5A1.5 1.5 0 0115 5.5v7A1.5 1.5 0 0113.5 14h-11A1.5 1.5 0 011 12.5z"/>`);
-  }
-  if (t === "section") {
-    // Stacked layers
-    return svg(`<path fill="#6b7280" d="M8.235 1.56a.5.5 0 00-.47 0l-7.5 4 7.5 4 7.5-4-7.5-4zm-7.13 8.96l7 3.734 7-3.734-1-.534L8 13.197 1.895 10.52l-1-.535-.789.535z"/>`);
-  }
-  if (t === "resourcepdf" || t === "pdf" || t === "resourcepdfpage") {
-    // Document (red)
-    return svg(`<path fill="#dc2626" d="M9.5 0H4a2 2 0 00-2 2v12a2 2 0 002 2h8a2 2 0 002-2V4.5L9.5 0zm0 1.5V4a.5.5 0 00.5.5H13V14a1 1 0 01-1 1H4a1 1 0 01-1-1V2a1 1 0 011-1h5.5z"/><path fill="#dc2626" d="M4.5 8h7v1h-7zm0 2h7v1h-7zm0 2h4v1h-4z"/>`);
-  }
-  // Default: presentation/slides
-  return svg(`<path fill="#3b82f6" d="M0 2.5A1.5 1.5 0 011.5 1h13A1.5 1.5 0 0116 2.5v9A1.5 1.5 0 0114.5 13H9l.5.5H11a.5.5 0 010 1H5a.5.5 0 010-1h1.5l.5-.5H1.5A1.5 1.5 0 010 11.5zm1.5-.5a.5.5 0 00-.5.5v9a.5.5 0 00.5.5h13a.5.5 0 00.5-.5v-9a.5.5 0 00-.5-.5z"/>`);
-}
-
-function buildFormHtml(
-  templateName: string,
-  adhocInputs: Array<Record<string, unknown>>,
-  varListInputs: Array<Record<string, unknown>>,
-  manualSelect: Record<string, unknown> | undefined,
-  forms: Array<Record<string, unknown>>,
-  teamSiteId: string,
-  versionId: string,
-  token: string
-): string {
-  const isTable = (i: Record<string, unknown>) => ((gf(i, "columns") as unknown[] | undefined)?.length ?? 0) > 0;
-  const scalarAdhoc = adhocInputs.filter(i => !isTable(i));
-  const tableAdhoc  = adhocInputs.filter(i => isTable(i));
-
-  const scalarGrid = scalarAdhoc.length
-    ? `<div class="grid">${scalarAdhoc.map(i => scalarInput(String(gf(i, "name") ?? ""), String(gf(i, "type") ?? "STRING"), "adhoc")).join("")}</div>`
-    : "";
-
-  const tableHtml = tableAdhoc.map(i =>
-    tableInput(String(gf(i, "name") ?? ""), (gf(i, "columns") as Array<Record<string, unknown>>) ?? [], "adhoc")
-  ).join("");
-
-  const vlHtml = varListInputs.map(vl => {
-    const vlName   = String(gf(vl, "variableListName") ?? "");
-    const dsName   = String(gf(vl, "dataSourceName") ?? gf(vl, "dataSourceId") ?? "");
-    const inputs   = (gf(vl, "variableInputs") as Array<Record<string, unknown>>) ?? [];
-    const scVl     = inputs.filter(i => !isTable(i));
-    const tVl      = inputs.filter(i => isTable(i));
-    const dsSpan   = dsName ? ` <span class="badge">${esc(dsName)}</span>` : "";
-    const scGrid   = scVl.length ? `<div class="grid">${scVl.map(i => scalarInput(String(gf(i, "name") ?? ""), String(gf(i, "type") ?? "STRING"), "vl", vlName)).join("")}</div>` : "";
-    const tblParts = tVl.map(i => tableInput(String(gf(i, "name") ?? ""), (gf(i, "columns") as Array<Record<string, unknown>>) ?? [], "vl", vlName)).join("");
-    return `<div class="section"><div class="sl">Variable list — ${esc(vlName)}${dsSpan}</div>${scGrid}${tblParts}</div>`;
-  }).join("");
-
-  // Manual select groups/sections (plain include/exclude) and external content (one or more
-  // resolved candidates picked via checkboxes — candidates are pre-attached by handleGetInputs).
-  let msHtml = "";
-  if (manualSelect) {
-    const items = (gf(manualSelect, "manualSelectContentItems") as Array<Record<string, unknown>>) ?? [];
-    const groups = items.filter(i => ["Group", "Section"].includes(String(gf(i, "contentType") ?? "")));
-    const external = items.filter(i => !["Group", "Section"].includes(String(gf(i, "contentType") ?? "")));
-
-    const hasGroupImages = groups.some(g => !!gf(g, "imageUrl"));
-    const checks = groups.map(g => {
-      const gId = esc(String(gf(g, "id") ?? ""));
-      const gName = esc(String(gf(g, "name") ?? ""));
-      const gType = String(gf(g, "contentType") ?? "Group");
-      const gTypeEsc = esc(gType);
-      const inc = gf(g, "isInclude") !== false ? " checked" : "";
-      const oi = Number(gf(g, "orderIndex") ?? 0);
-      const imgUrl = String(gf(g, "imageUrl") ?? "");
-      const labelEl = `<label class="grp"><input type="checkbox"${inc} data-group-id="${gId}" data-group-name="${gName}" data-order-index="${oi}" data-content-type="${gTypeEsc}">${contentTypeIconSvg(gType)}<span>${gName}</span></label>`;
-      if (imgUrl) {
-        return `<div class="grp-card"><img class="grp-thumb" src="${esc(imgUrl)}" alt="${gName}" loading="lazy" crossorigin="anonymous" onerror="this.style.display='none'">${labelEl}</div>`;
-      }
-      return labelEl;
-    }).join("");
-    const listClass = hasGroupImages ? "grp-list grp-list-cards" : "grp-list";
-    const groupsHtml = groups.length
-      ? `<div class="section"><div class="sl">Content selection</div><div class="${listClass}">${checks}</div></div>`
-      : "";
-
-    const externalHtml = external.map(item => {
-      const iId = esc(String(gf(item, "id") ?? ""));
-      const iName = esc(String(gf(item, "name") ?? ""));
-      const iContentType = String(gf(item, "contentType") ?? "");
-      const iIcon = contentTypeIconSvg(iContentType);
-      const oi = Number(gf(item, "orderIndex") ?? 0);
-      const candidates = (gf(item, "candidates") as Array<Record<string, unknown>> | undefined) ?? [];
-      if (!candidates.length) {
-        return `<div class="ext-item"><div class="sl" style="margin-bottom:6px">${iIcon}${iName}</div><span class="badge" style="background:#fde8e8;color:#c00">No matching content found</span></div>`;
-      }
-      const totalCount = Number(gf(item, "candidatesTotalCount") ?? candidates.length);
-      const truncatedNote = totalCount > candidates.length
-        ? ` <span class="badge">Showing ${candidates.length} of ${totalCount} matches — refine the template's content filter if you need a different one</span>`
-        : "";
-      // Multiple documents can be attached to the same slot, so each candidate is its own
-      // checkbox rather than a single-select dropdown — checking N boxes submits N items
-      // that all share this slot's id/name but carry different resolved versionId/format.
-      const candidateChecks = candidates.map((c, i) => {
-        const val = esc(JSON.stringify({ versionId: gf(c, "versionId"), sourceBlobId: gf(c, "sourceBlobId"), format: gf(c, "format") }));
-        const cFormat = String(gf(c, "format") ?? "");
-        const cIcon = contentTypeIconSvg(cFormat.toLowerCase() === "pdf" ? "resourcepdf" : "liveslide");
-        const label = esc(`${String(gf(c, "title") ?? "")} (${cFormat})`);
-        const checkedAttr = i === 0 ? " checked" : "";
-        return `<label class="grp"><input type="checkbox"${checkedAttr} data-external-candidate="${iId}" data-external-name="${iName}" data-order-index="${oi}" value='${val}'>${cIcon}<span>${label}</span></label>`;
-      }).join("");
-      return `<div class="ext-item"><div class="sl" style="margin-bottom:6px">${iIcon}${iName}${truncatedNote}</div><div class="grp-list">${candidateChecks}</div></div>`;
-    }).join("");
-
-    msHtml = groupsHtml + (externalHtml ? `<div class="section"><div class="sl">External content</div>${externalHtml}</div>` : "");
-  }
-
-  // Group forms by unique name → { formName: [{outputs}, ...] }
-  type FormCfg = { outputs: Array<{ format: unknown }> };
-  const formsByName = new Map<string, FormCfg[]>();
-  for (const f of forms) {
-    const name = String(gf(f, "name") ?? "");
-    if (!formsByName.has(name)) formsByName.set(name, []);
-    formsByName.get(name)!.push({
-      outputs: ((gf(f, "outputs") as Array<Record<string, unknown>>) ?? []).map(o => ({ format: gf(o, "format") })),
-    });
-  }
-  const uniqueFormNames = Array.from(formsByName.keys());
-  const multiForm = uniqueFormNames.length > 1;
-
-  // Initial state: first form name, first output combo
-  const firstFormName = uniqueFormNames[0] ?? "";
-  const firstFormCfgs = formsByName.get(firstFormName) ?? [];
-  const initOutputs = JSON.stringify(firstFormCfgs[0]?.outputs ?? []);
-
-  // Form selector (only when >1 distinct form name)
-  const formSelHtml = multiForm
-    ? `<div class="fmt-row"><div class="sl" style="margin-bottom:10px">Select form</div><div id="form-sel">${
-        uniqueFormNames.map((n, i) =>
-          `<button class="fmt${i === 0 ? " active" : ""}" data-form-name="${esc(n)}" onclick="selForm(this)">${esc(n)}</button>`
-        ).join("")
-      }</div></div>`
-    : "";
-
-  // Initial output format buttons (format codes, not form names)
-  const fmtBtnsHtml = firstFormCfgs.map((cfg, i) => {
-    const label = esc(cfg.outputs.map(o => String(o.format)).join(" + ") || "Default");
-    return `<button class="fmt${i === 0 ? " active" : ""}" data-outputs="${esc(JSON.stringify(cfg.outputs))}" onclick="selFmt(this)">${label}</button>`;
-  }).join("");
-
-  // JS config: all form configs keyed by name
-  const formConfigsJs = JSON.stringify(
-    Object.fromEntries(Array.from(formsByName.entries()))
-  );
-
-  const css = `*{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
-body{background:#fff;padding:20px;font-size:14px;color:#1d1d1f}
-.title{font-size:17px;font-weight:700;margin-bottom:20px}
-.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px 16px;margin-bottom:20px;align-items:end}
-.fw{display:flex;flex-direction:column;gap:5px}
-.fl{font-size:12px;font-weight:600;color:#555}
-.fi{width:100%;padding:7px 10px;border:1px solid #d0d0d0;border-radius:7px;font-size:13px;outline:none;background:#fff}
-.fi:focus{border-color:#0066cc}
-.bool-field{display:flex;align-items:center;gap:8px;padding-bottom:10px}
-.bool-field input{width:16px;height:16px;cursor:pointer;flex-shrink:0}
-.bool-field label{font-size:12px;font-weight:600;color:#555;cursor:pointer}
-.section{margin-bottom:20px}
-.sl{font-size:13px;font-weight:700;color:#444;margin-bottom:10px}
-.badge{display:inline-block;padding:1px 7px;border-radius:100px;font-size:11px;font-weight:600;background:#e8f0fe;color:#0066cc;margin-left:6px}
-.tbl-wrap{margin-bottom:20px}
-.dt{width:100%;border-collapse:collapse;font-size:13px}
-.dt th{font-size:12px;font-weight:600;color:#666;padding:6px 8px;text-align:left;border-bottom:1px solid #e5e5e5;background:#fafafa}
-.dt td{padding:4px 6px;border-bottom:1px solid #f5f5f5}
-.dt td input[type=text],.dt td input[type=number],.dt td input[type=date]{width:100%;padding:5px 7px;border:1px solid #d0d0d0;border-radius:5px;font-size:12px;outline:none}
-.dt td input[type=text]:focus,.dt td input[type=number]:focus,.dt td input[type=date]:focus{border-color:#0066cc}
-.dt td input[type=checkbox]{width:16px;height:16px;cursor:pointer}
-.del{background:none;border:none;cursor:pointer;color:#ccc;font-size:15px;padding:2px 5px}
-.del:hover{color:#c00}
-.add-btn{font-size:12px;color:#0066cc;background:none;border:1px dashed #0066cc;border-radius:6px;padding:5px 14px;cursor:pointer;margin-top:6px}
-.add-btn:hover{background:#e8f0fe}
-.fmt-row{margin-bottom:20px}
-.fmt{padding:7px 18px;border-radius:20px;border:none;background:#f0f0f0;color:#444;font-size:13px;font-weight:500;cursor:pointer;margin-right:8px;transition:background .15s}
-.fmt.active{background:#0066cc;color:#fff}
-.sub{display:inline-flex;align-items:center;gap:6px;padding:9px 22px;background:#0066cc;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer}
-.sub:hover{background:#0055b3}
-.grp-list{display:flex;flex-direction:column;gap:8px}
-.grp{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px}
-.grp input{width:16px;height:16px}
-.ext-item{margin-bottom:14px;padding:10px 12px;border:1px solid #e5e5e5;border-radius:8px}
-.ct-icon{width:14px;height:14px;display:inline-block;vertical-align:middle;margin-right:5px;flex-shrink:0}
-.grp-list-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
-.grp-card{border:1px solid #e5e5e5;border-radius:8px;overflow:hidden;cursor:pointer;transition:box-shadow .15s}
-.grp-card:hover{box-shadow:0 2px 8px rgba(0,0,0,.1)}
-.grp-card:has(input:checked){border-color:#0066cc;box-shadow:0 0 0 2px rgba(0,102,204,.15)}
-.grp-thumb{width:100%;height:80px;object-fit:cover;display:block;background:#f0f2f5}
-.grp-card .grp{padding:8px 10px}`;
-
-  const js = `var sel=${initOutputs};
-var tsid=${JSON.stringify(teamSiteId)};
-var vid=${JSON.stringify(versionId)};
-var formToken=${JSON.stringify(token)};
-var formCfgs=${formConfigsJs};
-function selFmt(b){
-  sel=JSON.parse(b.dataset.outputs);
-  document.querySelectorAll('#fmt-btns .fmt').forEach(function(x){x.classList.remove('active')});
-  b.classList.add('active');
-}
-function selForm(b){
-  document.querySelectorAll('#form-sel .fmt').forEach(function(x){x.classList.remove('active')});
-  b.classList.add('active');
-  var cfgs=formCfgs[b.dataset.formName]||[];
-  var div=document.getElementById('fmt-btns');
-  div.innerHTML='';
-  cfgs.forEach(function(cfg,i){
-    var btn=document.createElement('button');
-    btn.className='fmt'+(i===0?' active':'');
-    btn.dataset.outputs=JSON.stringify(cfg.outputs);
-    btn.textContent=cfg.outputs.map(function(o){return o.format;}).join(' + ')||'Default';
-    btn.onclick=function(){selFmt(this);};
-    div.appendChild(btn);
-  });
-  if(cfgs.length)sel=cfgs[0].outputs;
-}
-function addRow(tid){
-  var tbl=document.querySelector('[data-table-id="'+tid+'"]');
-  if(!tbl)return;
-  var cols=JSON.parse(tbl.dataset.cols||'[]');
-  var tb=document.getElementById(tid+'-body');
-  if(!tb)return;
-  var tr=document.createElement('tr');
-  cols.forEach(function(c){
-    var td=document.createElement('td');
-    var t=(c.type||'').toUpperCase();
-    var el;
-    if(t==='BOOL'||t==='BOOLEAN'){el=document.createElement('input');el.type='checkbox';}
-    else if(t==='DATE'){el=document.createElement('input');el.type='date';}
-    else{el=document.createElement('input');el.type=(t==='INTEGER'||t==='FLOAT')?'number':'text';if(t==='INTEGER')el.step='1';if(t==='FLOAT')el.step='any';}
-    el.dataset.colType=t;td.appendChild(el);tr.appendChild(td);
-  });
-  var dtd=document.createElement('td');
-  var db=document.createElement('button');
-  db.className='del';db.innerHTML='&#128465;';
-  db.onclick=function(){this.closest('tr').remove();};
-  dtd.appendChild(db);tr.appendChild(dtd);tb.appendChild(tr);
-}
-function tblVal(tbl){
-  var cols=JSON.parse(tbl.dataset.cols||'[]');
-  var rows=Array.from(tbl.querySelectorAll('tbody tr')).map(function(tr){
-    return Array.from(tr.querySelectorAll('[data-col-type]')).map(function(c){
-      var t=(c.dataset.colType||'').toUpperCase();
-      if(t==='BOOL'||t==='BOOLEAN')return c.checked;
-      if(t==='INTEGER')return parseInt(c.value)||0;
-      if(t==='FLOAT')return parseFloat(c.value)||0;
-      return c.value;
-    });
-  });
-  return{columns:cols.map(function(c){return c.name;}),rows:rows};
-}
-function scVal(el){
-  var t=(el.dataset.fieldType||'').toUpperCase();
-  if(t==='BOOL'||t==='BOOLEAN')return el.checked;
-  if(t==='INTEGER')return parseInt(el.value)||0;
-  if(t==='FLOAT')return parseFloat(el.value)||0;
-  return el.value;
-}
-function submit(){
-  var adhoc=[];
-  document.querySelectorAll('[data-scope="adhoc"]').forEach(function(el){adhoc.push({name:el.dataset.fieldName,value:scVal(el)});});
-  document.querySelectorAll('.dt[data-table-scope="adhoc"]').forEach(function(t){adhoc.push({name:t.dataset.tableName,value:tblVal(t)});});
-  var vlmap={};
-  document.querySelectorAll('[data-scope="vl"]').forEach(function(el){var v=el.dataset.vlName;if(!vlmap[v])vlmap[v]=[];vlmap[v].push({name:el.dataset.fieldName,value:scVal(el)});});
-  document.querySelectorAll('.dt[data-table-scope="vl"]').forEach(function(t){var v=t.dataset.vlName;if(!vlmap[v])vlmap[v]=[];vlmap[v].push({name:t.dataset.tableName,value:tblVal(t)});});
-  // Skip variable list entries where every input is empty (empty string or table with no rows).
-  var vld=Object.keys(vlmap).filter(function(k){
-    return vlmap[k].some(function(inp){
-      var v=inp.value;
-      if(v===null||v===undefined||v==='')return false;
-      if(typeof v==='object'&&Array.isArray(v.rows))return v.rows.length>0;
-      return true;
-    });
-  }).map(function(k){return{variableListName:k,variableInputs:vlmap[k]};});
-  var ms=[];
-  document.querySelectorAll('[data-group-id]').forEach(function(cb){ms.push({id:cb.dataset.groupId,name:cb.dataset.groupName,contentType:cb.dataset.contentType||'Group',isInclude:cb.checked,orderIndex:parseInt(cb.dataset.orderIndex)||0});});
-  // Multiple documents can be attached to the same external-content slot: group checkboxes by
-  // slot id, then emit one manualSelectContentItem PER CHECKED candidate (all sharing that
-  // slot's id/name), or a single isInclude:false item if none are checked.
-  var extGroups={};
-  document.querySelectorAll('[data-external-candidate]').forEach(function(cb){
-    var id=cb.dataset.externalCandidate;
-    if(!extGroups[id])extGroups[id]={name:cb.dataset.externalName,orderIndex:parseInt(cb.dataset.orderIndex)||0,checked:[]};
-    if(cb.checked)extGroups[id].checked.push(JSON.parse(cb.value));
-  });
-  Object.keys(extGroups).forEach(function(id){
-    var g=extGroups[id];
-    if(g.checked.length){
-      g.checked.forEach(function(chosen){
-        var item={id:id,name:g.name,isInclude:true,orderIndex:g.orderIndex,versionId:chosen.versionId,contentType:(chosen.format||'').toUpperCase()==='PDF'?'ResourcePDF':'LiveSlide'};
-        if(chosen.sourceBlobId)item.sourceBlobId=chosen.sourceBlobId;
-        ms.push(item);
-      });
-    }else{
-      ms.push({id:id,name:g.name,contentType:'LiveSlide',isInclude:false,orderIndex:g.orderIndex});
-    }
-  });
-  var p={teamSiteId:tsid,libraryContentVersionId:vid,adHocInputs:adhoc,outputs:sel};
-  if(vld.length)p.variableListData=vld;
-  if(ms.length)p.manualSelectContentInput={manualSelectContentItems:ms};
-  var msg=JSON.stringify(p);
-  var btn=document.getElementById('sub-btn');
-  btn.disabled=true;btn.textContent='Submitting…';
-  // Send via postMessage to parent App panel shell (avoids browser fetch CSP restrictions).
-  // The shell relays it to the MCP server via callServerTool.
-  window.parent.postMessage({type:'livedoc-submit',token:formToken,payload:msg},'*');
-  // Show success immediately — shell will signal back on error.
-  btn.style.display='none';
-  document.getElementById('done-msg').style.display='block';
-}
-function copyPayload(){
-  var t=document.getElementById('payload-text');
-  t.select();
-  try{navigator.clipboard.writeText(t.value).then(function(){document.getElementById('copy-btn').textContent='Copied!';}).catch(function(){document.execCommand('copy');document.getElementById('copy-btn').textContent='Copied!';});}
-  catch(e){try{document.execCommand('copy');document.getElementById('copy-btn').textContent='Copied!';}catch(e2){}}
-}`;
-
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>${css}</style></head><body>
-<div class="title">${esc(templateName)} — inputs</div>
-${scalarGrid}${tableHtml}${vlHtml}${msHtml}
-${formSelHtml}
-<div class="fmt-row"><div class="sl" style="margin-bottom:10px">Output format</div><div id="fmt-btns">${fmtBtnsHtml}</div></div>
-<button id="sub-btn" class="sub" onclick="submit()">&#9654; Submit generation</button>
-<div id="done-msg" style="display:none;margin-top:16px;padding:14px;background:#f0faf0;border:1.5px solid #b2dfb2;border-radius:8px;color:#2e7d32;font-weight:600;font-size:14px">&#10003; Submitted! Generation starting…</div>
-<div id="payload-box" style="display:none;margin-top:16px;padding:14px;background:#f0f7ff;border:1.5px solid #90b8e8;border-radius:8px">
-  <div style="font-weight:600;font-size:13px;margin-bottom:8px;color:#0055aa">Copy this payload and paste it into the chat:</div>
-  <textarea id="payload-text" readonly style="width:100%;height:72px;font-size:11px;font-family:monospace;border:1px solid #b0c8e8;border-radius:4px;padding:6px;box-sizing:border-box;resize:none;background:#fff"></textarea>
-  <button id="copy-btn" onclick="copyPayload()" style="margin-top:8px;padding:7px 20px;background:#0066cc;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">&#128203; Copy to clipboard</button>
-</div>
-<div id="paste-hint" style="display:none;margin-top:12px;padding:12px 14px;background:#fff8e1;border:1.5px solid #f9a825;border-radius:8px;font-size:13px;color:#5d4037">
-  <b>Auto-submit unavailable in this view.</b><br>The payload has been copied to your clipboard. Paste it into the chat and Claude will continue from there.
-</div>
-<script>${js}<\/script>
-</body></html>`;
-}
 
 // ── Tool handlers ───────────────────────────────────────────────────────────
 
@@ -891,9 +326,11 @@ async function resolveManualSelectCandidates(item: Record<string, unknown>): Pro
   const data = result.body as { documents?: Array<Record<string, unknown>>; totalCount?: number };
   const candidates = (data.documents ?? []).slice(0, CANDIDATE_PAGE_SIZE).map((d) => ({
     versionId: gf(d, "contentVersionId"),
+    contentId: gf(d, "contentId"),
     sourceBlobId: gf(d, "sourceBlobId"),
     title: gf(d, "title"),
     format: gf(d, "format"),
+    thumbnailUrl: String(gf(d, "thumbnailUrl") ?? ""),
   }));
   return { candidates, totalCount: data.totalCount ?? candidates.length };
 }
@@ -955,6 +392,113 @@ async function handleGetInputs(args: {
   };
 }
 
+function gf(o: Record<string, unknown>, key: string): unknown {
+  return o[key] ?? o[key[0].toUpperCase() + key.slice(1)];
+}
+
+function buildFormSchema(
+  ir: {
+    templateName: string;
+    teamSiteId: string;
+    libraryContentVersionId: string;
+    adhocInputs: Array<Record<string, unknown>>;
+    variableListData: Array<Record<string, unknown>>;
+    manualSelectContentInput: Record<string, unknown> | undefined;
+    forms: Array<Record<string, unknown>>;
+  },
+  token: string
+): unknown {
+  const isTable = (i: Record<string, unknown>) => ((gf(i, "columns") as unknown[] | undefined)?.length ?? 0) > 0;
+
+  const adhocScalars = ir.adhocInputs.filter(i => !isTable(i)).map(i => ({
+    name: String(gf(i, "name") ?? ""),
+    type: String(gf(i, "type") ?? "STRING"),
+  }));
+
+  const adhocTables = ir.adhocInputs.filter(i => isTable(i)).map(i => ({
+    name: String(gf(i, "name") ?? ""),
+    columns: ((gf(i, "columns") as Array<Record<string, unknown>>) ?? []).map(c => ({
+      name: String(gf(c, "name") ?? ""),
+      colType: String(gf(c, "colType") ?? gf(c, "type") ?? "TEXT"),
+    })),
+  }));
+
+  const variableLists = ir.variableListData.map(vl => {
+    const inputs = (gf(vl, "variableInputs") as Array<Record<string, unknown>>) ?? [];
+    return {
+      name: String(gf(vl, "variableListName") ?? ""),
+      dataSourceName: String(gf(vl, "dataSourceName") ?? gf(vl, "dataSourceId") ?? ""),
+      scalars: inputs.filter(i => !isTable(i)).map(i => ({
+        name: String(gf(i, "name") ?? ""),
+        type: String(gf(i, "type") ?? "STRING"),
+      })),
+      tables: inputs.filter(i => isTable(i)).map(i => ({
+        name: String(gf(i, "name") ?? ""),
+        columns: ((gf(i, "columns") as Array<Record<string, unknown>>) ?? []).map(c => ({
+          name: String(gf(c, "name") ?? ""),
+          colType: String(gf(c, "colType") ?? gf(c, "type") ?? "TEXT"),
+        })),
+      })),
+    };
+  });
+
+  const msItems = (ir.manualSelectContentInput
+    ? gf(ir.manualSelectContentInput, "manualSelectContentItems")
+    : undefined) as Array<Record<string, unknown>> | undefined ?? [];
+
+  const slideGroups = msItems
+    .filter(i => ["Group", "Section"].includes(String(gf(i, "contentType") ?? "")))
+    .map(i => ({
+      id: String(gf(i, "id") ?? ""),
+      name: String(gf(i, "name") ?? ""),
+      contentType: String(gf(i, "contentType") ?? "Group"),
+      orderIndex: Number(gf(i, "orderIndex") ?? 0),
+      defaultInclude: gf(i, "isInclude") !== false,
+      thumbnailUrl: String(
+        gf(i, "thumbnailUrl") ?? gf(i, "previewImageUrl") ?? gf(i, "imageUrl") ??
+        ((gf(i, "pages") ?? gf(i, "Pages")) as Array<Record<string, unknown>> | undefined)?.[0]?.ImageUrl ??
+        ((gf(i, "pages") ?? gf(i, "Pages")) as Array<Record<string, unknown>> | undefined)?.[0]?.imageUrl ??
+        ""
+      ),
+    }));
+
+  const externalContent = msItems
+    .filter(i => !["Group", "Section"].includes(String(gf(i, "contentType") ?? "")))
+    .map(i => ({
+      id: String(gf(i, "id") ?? ""),
+      name: String(gf(i, "name") ?? ""),
+      contentType: String(gf(i, "contentType") ?? ""),
+      orderIndex: Number(gf(i, "orderIndex") ?? 0),
+      candidates: ((i.candidates as Array<Record<string, unknown>>) ?? []).map(c => ({
+        versionId: String(c.versionId ?? ""),
+        contentId: String(c.contentId ?? ""),
+        ...(c.sourceBlobId ? { sourceBlobId: String(c.sourceBlobId) } : {}),
+        title: String(c.title ?? ""),
+        format: String(c.format ?? "PPTX"),
+        thumbnailUrl: String(c.thumbnailUrl ?? ""),
+      })),
+    }));
+
+  // Dump raw forms to a temp debug file so we can inspect the actual API shape.
+  fs.writeFileSync(path.join(os.tmpdir(), `mcp-livedoc-debug-forms.json`), JSON.stringify(ir.forms, null, 2), "utf-8");
+
+  // Group forms by name; collect distinct output combinations per group.
+  const formsByName = new Map<string, Array<Array<{ format: string; name?: string }>>>();
+  for (const f of ir.forms) {
+    const name = String(gf(f, "name") ?? "");
+    const rawOutputs = (gf(f, "outputs") ?? gf(f, "outputFormats") ?? gf(f, "outputDefinitions")) as Array<Record<string, unknown>> | undefined;
+    const outputs = (rawOutputs ?? []).map(o => ({
+      format: String(gf(o, "format") ?? gf(o, "outputFormat") ?? "").toUpperCase(),
+      name: String(gf(o, "name") ?? gf(o, "displayName") ?? ""),
+    })).filter(o => o.format);
+    if (!formsByName.has(name)) formsByName.set(name, []);
+    formsByName.get(name)!.push(outputs);
+  }
+  const formOptions = Array.from(formsByName.entries()).map(([name, combos]) => ({ name, outputCombos: combos }));
+
+  return { token, templateName: ir.templateName, teamSiteId: ir.teamSiteId, libraryContentVersionId: ir.libraryContentVersionId, adhocScalars, adhocTables, variableLists, slideGroups, externalContent, formOptions };
+}
+
 async function handleSubmitGeneration(args: {
   teamSiteId: string;
   libraryContentVersionId: string;
@@ -989,7 +533,7 @@ async function handleSubmitGeneration(args: {
     if (unresolved.length > 0) {
       return {
         error: "WRONG TOOL — do not call submit_livedoc_generation directly when manualSelectContentInput has unresolved items.",
-        detail: `Item(s) [${unresolved.map((i) => `"${i.name ?? i.id}"`).join(", ")}] are missing versionId. You must NOT resolve versionId yourself via search_livedoc_content or any other tool. The correct flow is: (1) get_livedoc_inputs opens an HTML form, (2) the USER fills in the form and clicks Submit, (3) you call wait_for_form_submit to receive the fully-resolved payload, (4) THEN call this tool with that exact payload. If you have not yet called wait_for_form_submit, call it now with the token from get_livedoc_inputs.`,
+        detail: `Item(s) [${unresolved.map((i) => `"${i.name ?? i.id}"`).join(", ")}] are missing versionId. You must NOT resolve versionId yourself via search_livedoc_content or any other tool. The correct flow is: (1) get_livedoc_inputs opens the form in the App panel, (2) the USER fills it out and clicks Submit — the payload is copied to their clipboard, (3) the user pastes the payload into the chat, (4) THEN call this tool with that exact pasted JSON.`,
       };
     }
   }
@@ -1082,13 +626,23 @@ async function handleGetDownloadUrl(args: {
   generatedLivedocId: string;
   outputId: string;
 }) {
+  // Primary: redirect=false returns JSON with downloadUrl
   const result = await apiFetch(
     `/v3/generatedLivedocs/${args.generatedLivedocId}/outputs/${args.outputId}/content?redirect=false`
   );
-  if (result.status !== 200) {
-    return { error: `Download URL fetch failed (HTTP ${result.status})`, detail: result.body };
+  if (result.status === 200) {
+    return result.body;
   }
-  return result.body;
+  // Fallback: capture the 302 Location header (works when redirect=false returns 403)
+  try {
+    const res = await fetch(
+      `${BASE_URL}/v3/generatedLivedocs/${args.generatedLivedocId}/outputs/${args.outputId}/content`,
+      { headers: authHeaders() as Record<string, string>, redirect: "manual" as RequestRedirect }
+    );
+    const location = res.headers.get("location");
+    if (location) return { downloadUrl: location };
+  } catch { /* ignore, fall through */ }
+  return { error: `Download URL fetch failed (HTTP ${result.status})`, detail: result.body };
 }
 
 function getDownloadsDir(): string {
@@ -1149,7 +703,9 @@ async function handleDownloadGenerationOutput(args: {
       (o) => o.id === args.outputId || (o.format ?? "").toLowerCase() === args.outputId.toLowerCase()
     );
     if (match) {
-      fileName = match.fileName || `${fileName}.${(match.format ?? "").toLowerCase()}`;
+      const rawName = match.fileName || fileName;
+      const ext = path.extname(rawName);
+      fileName = ext ? rawName : `${rawName}.${(match.format ?? "pptx").toLowerCase()}`;
     }
   }
 
@@ -1181,52 +737,6 @@ function generateToken(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-async function handleWaitForFormSubmit(args: { token: string }): Promise<unknown> {
-  const dbg = (msg: string) => fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] WAIT_SUBMIT pid=${process.pid} token=${args.token} ${msg}\n`);
-  dbg(`called preSize=${preReceivedPayloads.size} pendingSize=${pendingForms.size}`);
-  const submitFile = path.join(os.tmpdir(), `livedoc-submit-${args.token}.json`);
-  const TIMEOUT_MS = 10 * 60 * 1000;
-  return new Promise((resolve, reject) => {
-    const done = (payload: unknown) => {
-      clearTimeout(timer);
-      clearInterval(poller);
-      pendingForms.delete(args.token);
-      dbg("resolved");
-      resolve(payload);
-    };
-    const timer = setTimeout(() => {
-      clearInterval(poller);
-      pendingForms.delete(args.token);
-      dbg("timeout");
-      reject(new Error("Form submission timed out after 10 minutes."));
-    }, TIMEOUT_MS);
-    // In-process resolver (same process as receive_form_submission).
-    pendingForms.set(args.token, (payload) => done(payload));
-    // Cross-process file poller (different process wrote the file).
-    const poller = setInterval(() => {
-      if (fs.existsSync(submitFile)) {
-        try {
-          const raw = fs.readFileSync(submitFile, "utf-8");
-          fs.unlinkSync(submitFile);
-          dbg("resolved via file");
-          done(JSON.parse(raw));
-        } catch (e) {
-          reject(e);
-        }
-      }
-    }, 500);
-    // Check immediately in case file was written before we started polling.
-    if (fs.existsSync(submitFile)) {
-      try {
-        const raw = fs.readFileSync(submitFile, "utf-8");
-        fs.unlinkSync(submitFile);
-        dbg("fast-path file");
-        done(JSON.parse(raw));
-      } catch (e) { /* poller will retry */ }
-    }
-    dbg(`resolver registered, polling ${submitFile}`);
-  });
-}
 
 async function handleOpenFormUi(args: { teamSiteId: string; libraryContentVersionId: string; context?: string; prefillValues?: unknown }) {
   // Push the current token to the form server so it never uses a stale value.
@@ -1259,7 +769,7 @@ async function handleOpenFormUi(args: { teamSiteId: string; libraryContentVersio
     token,
     message: [
       `The form has been opened in the browser: ${url}`,
-      `IMPORTANT: Call get_form_result with token="${token}" after the user submits the form — NOT wait_for_form_submit (that tool is for a different code path and will hang forever here).`,
+      `IMPORTANT: Call get_form_result with token="${token}" after the user submits the form.`,
       `get_form_result polls until the form app posts the result, then returns the generatedLivedocId and outputs.`,
     ].join("\n"),
   };
@@ -1343,18 +853,11 @@ registerAppResource(
   server,
   "LiveDoc Form",
   FORM_RESOURCE_URI,
-  {
-    description: "LiveDoc input form — dynamically generated per template.",
-    _meta: { ui: { csp: { frameDomains: ["http://127.0.0.1:3099"], connectDomains: ["http://127.0.0.1:3099"] } } },
-  } as Parameters<typeof registerAppResource>[3],
-  async () => {
-    const bundle = await getExtAppsBundle();
-    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] resources/read: ui://livedoc/form fetched (shell, bundle=${bundle.length}b)\n`);
-    return { contents: [{
-      uri: FORM_RESOURCE_URI,
-      mimeType: RESOURCE_MIME_TYPE,
-      text: buildShellHtml(bundle),
-    }] };
+  { description: "LiveDoc input form — React shell built by Vite." } as Parameters<typeof registerAppResource>[3],
+  () => {
+    const shellPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "views", "form-shell.html");
+    const text = fs.readFileSync(shellPath, "utf-8");
+    return { contents: [{ uri: FORM_RESOURCE_URI, mimeType: RESOURCE_MIME_TYPE, text }] };
   }
 );
 
@@ -1402,9 +905,12 @@ registerAppTool(
   "get_livedoc_inputs",
   {
     description:
-      "Retrieve the full input schema for a LiveDoc template and open the interactive input form in the Cowork panel. " +
-      "After calling this tool the form will appear in the MCP App panel. " +
-      "Immediately call wait_for_form_submit with the returned token and wait for the user to submit the form. " +
+      "Retrieve the full input schema for a LiveDoc template and open the interactive input form in the App panel. " +
+      "The form appears in the App panel automatically. The user fills it out and clicks Submit — " +
+      "generation starts directly from the panel. " +
+      "Once the user tells you generation is done (or the panel shows 'Generation complete'), " +
+      "call get_panel_result with the formToken to get the generatedLivedocId and download URLs, " +
+      "then call download_generation_output to save the file locally. " +
       "Do NOT build your own form, do NOT use AskUserQuestion.",
     inputSchema: {
       teamSiteId: z.string().describe("Team site identifier (UUID) that owns the template."),
@@ -1413,88 +919,41 @@ registerAppTool(
     _meta: { ui: { resourceUri: FORM_RESOURCE_URI } },
   },
   async (args) => {
-    const _dbgLog = (msg: string) => {
-      try { fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] ${msg}\n`); } catch { /* ignore */ }
-    };
-    _dbgLog("get_livedoc_inputs: start");
     const ir = await handleGetInputs(args as { teamSiteId: string; libraryContentVersionId: string });
-    _dbgLog(`get_livedoc_inputs: handleGetInputs done, hasError=${"error" in ir}`);
     if ("error" in ir) {
       return { content: [{ type: "text" as const, text: JSON.stringify(ir, null, 2) }], isError: true };
     }
 
-    const manualItems = (ir.manualSelectContentInput as Record<string, unknown> | undefined)
-      ?.manualSelectContentItems as unknown[] | undefined ?? [];
-    const isComplexForm = ir.hasImageUpload || manualItems.length > 12;
-    _dbgLog(`get_livedoc_inputs: isComplexForm=${isComplexForm}`);
-
-    if (isComplexForm) {
-      return {
-        content: [{ type: "text" as const, text: `This template has ${ir.hasImageUpload ? "image uploads" : `${manualItems.length} slide groups`} and requires the full Form Web App. Call open_form_ui with teamSiteId="${ir.teamSiteId}" and libraryContentVersionId="${ir.libraryContentVersionId}". After the user submits, call get_form_result (NOT wait_for_form_submit) with the token.` }],
-      };
-    }
-
     const formToken = generateToken();
-    _dbgLog("get_livedoc_inputs: calling buildFormHtml");
-    const formHtml = buildFormHtml(
-      ir.templateName,
-      ir.adhocInputs,
-      ir.variableListData,
-      ir.manualSelectContentInput,
-      ir.forms,
-      ir.teamSiteId,
-      ir.libraryContentVersionId,
-      formToken
+    const schema = buildFormSchema(ir, formToken);
+    pendingFormSchemas.set(formToken, schema);
+    // Write to temp file so Process 2 (App panel) can read it
+    fs.writeFileSync(
+      path.join(os.tmpdir(), `mcp-livedoc-schema-${formToken}.json`),
+      JSON.stringify(schema),
+      "utf-8"
     );
-    _dbgLog(`get_livedoc_inputs: buildFormHtml done, htmlLen=${formHtml.length}`);
+    // Overwrite the "latest" pointer so the panel can detect a new generation request
+    // even when the App panel was already open from a previous run.
+    fs.writeFileSync(
+      path.join(os.tmpdir(), `mcp-livedoc-latest-token.json`),
+      JSON.stringify({ formToken }),
+      "utf-8"
+    );
 
-    // Register the form HTML with the local HTTP server so the App panel can iframe it.
-    _dbgLog(`get_livedoc_inputs: pendingFormHtml.set ${formToken} mapSizeBefore=${pendingFormHtml.size}`);
-    pendingFormHtml.set(formToken, formHtml);
-    _dbgLog(`get_livedoc_inputs: pendingFormHtml.set done mapSizeAfter=${pendingFormHtml.size}`);
-
-    // Also save to Working folder as fallback if the panel doesn't appear.
-    const safeName = ir.templateName.replace(/[^a-zA-Z0-9 _-]/g, "").trim() || "livedoc-form";
-    const formFileName = `${safeName} (${formToken}).html`;
-    const formDir = findCoworkPath() || getDownloadsDir();
-    try { fs.mkdirSync(formDir, { recursive: true }); } catch { /* best-effort */ }
-    const formFilePath = uniqueFilePath(formDir, formFileName);
-    _dbgLog(`get_livedoc_inputs: writing html to ${formFilePath}`);
-    fs.writeFileSync(formFilePath, formHtml);
-    _dbgLog("get_livedoc_inputs: returning resource response");
-
-    const formUrl = `http://127.0.0.1:${FORM_PORT}/form/${formToken}`;
-    latestFormUrl = formUrl;
-    _dbgLog(`get_livedoc_inputs: latestFormUrl set to ${latestFormUrl}`);
     return {
       content: [{
         type: "text" as const,
-        text: `Form loaded (token="${formToken}"). The form is now showing in the MCP App panel. Call wait_for_form_submit NOW with token="${formToken}" — do not wait for the user to say anything first; the tool will block until they submit. If the panel does not appear, the user can open **${formFileName}** from the Working folder panel instead.`,
+        text: `Form opened in the App panel (formToken="${formToken}"). ` +
+          `The user fills it out and clicks Submit in the panel — generation runs automatically. ` +
+          `DO NOT call open_form_ui. DO NOT call submit_form. DO NOT call get_form_result. ` +
+          `Just tell the user to fill the form. When they say it is done, call get_panel_result with formToken="${formToken}".`,
       }],
-      structuredContent: { formToken, formUrl, formHtml },
+      structuredContent: { formToken },
     };
   }
 );
 
-// App-only tool: returns the full form HTML for the given token so the shell can
-// inject it via srcdoc (avoids HTTP requests from the sandboxed iframe).
-server.registerTool(
-  "get_form_html",
-  {
-    description: "Internal: called by the MCP App panel to retrieve the form HTML. Do NOT call this yourself.",
-    inputSchema: { token: z.string() },
-    _meta: { ui: { visibility: ["app"] } },
-  },
-  async (args) => {
-    const { token } = args as { token: string };
-    const html = pendingFormHtml.get(token) ?? null;
-    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"), `[${new Date().toISOString()}] get_form_html: token=${token} found=${html !== null} len=${html?.length ?? 0} mapSize=${pendingFormHtml.size} keys=${[...pendingFormHtml.keys()].slice(0,3).join(',')}\n`);
-    return {
-      content: [{ type: "text" as const, text: html ?? "" }],
-      structuredContent: { html, token },
-    };
-  }
-);
 
 server.registerTool(
   "log_debug_message",
@@ -1511,59 +970,290 @@ server.registerTool(
 );
 
 server.registerTool(
-  "receive_form_submission",
+  "get_form_schema",
   {
-    description: "Internal: relays the App panel form submission to the form server. Do NOT call this yourself.",
+    description: "Internal: returns the normalised form schema for the given token. Called by the App panel shell.",
+    inputSchema: { token: z.string() },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async (args) => {
+    const { token } = args as { token: string };
+    let schema = pendingFormSchemas.get(token);
+    if (!schema) {
+      // Process 2 (App panel) — read from temp file written by Process 1
+      const schemaPath = path.join(os.tmpdir(), `mcp-livedoc-schema-${token}.json`);
+      if (fs.existsSync(schemaPath)) {
+        schema = JSON.parse(fs.readFileSync(schemaPath, "utf-8"));
+        pendingFormSchemas.set(token, schema!);
+      }
+    }
+    return {
+      content: [{ type: "text" as const, text: schema ? "ok" : "schema-not-found" }],
+      ...(schema ? { structuredContent: schema as Record<string, unknown> } : {}),
+    };
+  }
+);
+
+// Lets the already-open App panel detect a new generation request without remounting.
+server.registerTool(
+  "get_latest_token",
+  {
+    description: "Internal: returns the formToken for the most recent get_livedoc_inputs call. " +
+      "The App panel polls this when idle/done so it can auto-reload when Claude triggers a new generation.",
+    inputSchema: { currentToken: z.string().optional() },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async (args) => {
+    const { currentToken } = args as { currentToken?: string };
+    const latestPath = path.join(os.tmpdir(), `mcp-livedoc-latest-token.json`);
+    if (!fs.existsSync(latestPath)) {
+      return { content: [{ type: "text" as const, text: "no-token" }], structuredContent: { formToken: null, isNew: false } };
+    }
+    const { formToken } = JSON.parse(fs.readFileSync(latestPath, "utf-8")) as { formToken: string };
+    const isNew = !!formToken && formToken !== currentToken;
+    return {
+      content: [{ type: "text" as const, text: isNew ? `new-token:${formToken}` : "same" }],
+      structuredContent: { formToken, isNew },
+    };
+  }
+);
+
+server.registerTool(
+  "submit_form",
+  {
+    description: "Internal: called by the App panel after the user submits the form. Triggers LiveDoc generation.",
     inputSchema: {
       token: z.string(),
-      payload: z.string().describe("JSON-serialized form payload"),
+      payload: z.string().describe("JSON-serialised generation payload built by the form"),
     },
     _meta: { ui: { visibility: ["app"] } },
   },
   async (args) => {
     const { token, payload } = args as { token: string; payload: string };
-    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
-      `[${new Date().toISOString()}] receive_form_submission: token=${token} payloadLen=${payload.length}\n`);
-    // First try in-process resolution (if running in the same process as wait_for_form_submit).
-    const resolver = pendingForms.get(token);
-    if (resolver) {
-      pendingForms.delete(token);
-      pendingFormHtml.delete(token);
-      try { resolver(JSON.parse(payload)); } catch { resolver(payload); }
-      fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
-        `[${new Date().toISOString()}] receive_form_submission: resolved in-process\n`);
-      return { content: [{ type: "text" as const, text: "ok" }] };
+    let schema = pendingFormSchemas.get(token) as { teamSiteId: string; libraryContentVersionId: string; templateName?: string } | undefined;
+    if (!schema) {
+      const schemaPath = path.join(os.tmpdir(), `mcp-livedoc-schema-${token}.json`);
+      if (fs.existsSync(schemaPath)) {
+        schema = JSON.parse(fs.readFileSync(schemaPath, "utf-8"));
+        pendingFormSchemas.set(token, schema!);
+        try { fs.unlinkSync(schemaPath); } catch { /* ignore */ }
+      }
     }
-    // Cross-process fallback: write a temp file that wait_for_form_submit polls.
-    // Two separate Node.js processes are spawned by Claude Desktop — they share no memory,
-    // and only one of them wins port 3099, so HTTP relay is unreliable.
-    const submitFile = path.join(os.tmpdir(), `livedoc-submit-${token}.json`);
-    fs.writeFileSync(submitFile, payload, "utf-8");
-    fs.appendFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
-      `[${new Date().toISOString()}] receive_form_submission: wrote file ${submitFile}\n`);
-    return { content: [{ type: "text" as const, text: "ok" }] };
+    if (!schema) {
+      return { content: [{ type: "text" as const, text: "error: schema not found" }], structuredContent: { error: "Schema not found for token" } };
+    }
+    let parsed: Record<string, unknown>;
+    try { parsed = JSON.parse(payload); } catch {
+      return { content: [{ type: "text" as const, text: "error: invalid JSON" }], structuredContent: { error: "Invalid payload JSON" } };
+    }
+    const result = await handleSubmitGeneration({
+      teamSiteId: schema.teamSiteId,
+      libraryContentVersionId: schema.libraryContentVersionId,
+      adHocInputs: (parsed.adHocInputs as Array<{ name: string; value: unknown }>) ?? [],
+      outputs: (parsed.outputs as Array<{ format: string; fileName?: string }>) ?? [],
+      variableListData: parsed.variableListData as never,
+      manualSelectContentInput: parsed.manualSelectContentInput as never,
+    });
+    // Write to temp files so get_panel_result (chat) can pick up the generatedLivedocId
+    const gid = (result as Record<string, unknown>).generatedLivedocId as string | undefined;
+    if (gid) {
+      pendingGenerations.set(gid, token);
+      const resultData = JSON.stringify({ generatedLivedocId: gid, status: "Generating", downloadUrls: [], templateName: schema?.templateName ?? "" });
+      fs.writeFileSync(path.join(os.tmpdir(), `mcp-livedoc-result-${token}.json`), resultData, "utf-8");
+      // Reverse-lookup file survives server restarts
+      fs.writeFileSync(path.join(os.tmpdir(), `mcp-livedoc-gid-${gid}.json`), JSON.stringify({ formToken: token }), "utf-8");
+    }
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(result) }],
+      structuredContent: result,
+    };
   }
 );
 
 server.registerTool(
-  "wait_for_form_submit",
+  "poll_generation",
+  {
+    description: "Internal: polls generation status. Called by App panel to track progress and get download URLs.",
+    inputSchema: { generatedLivedocId: z.string() },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async (args) => {
+    const { generatedLivedocId } = args as { generatedLivedocId: string };
+    const res = await apiFetch(`/v3/generatedLivedocs/${generatedLivedocId}`);
+    const dbg = (msg: string) => fs.appendFileSync(
+      path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
+      `[${new Date().toISOString()}] POLL: ${msg}\n`
+    );
+    if (res.status !== 200) {
+      dbg(`HTTP ${res.status} for ${generatedLivedocId}`);
+      return { content: [{ type: "text" as const, text: "error" }], structuredContent: { status: "Failed", error: `HTTP ${res.status}` } };
+    }
+    const body = res.body as Record<string, unknown>;
+    const topStatus = statusName(body.status ?? body.Status);
+    const outputs = ((body.outputs ?? body.Outputs) as Array<Record<string, unknown>>) ?? [];
+    const outputStatuses = outputs.map(o => statusName(o.status ?? o.Status));
+    const allDone = outputs.length > 0 && outputStatuses.every(s => s === "Completed" || s === "Failed");
+    dbg(`id=${generatedLivedocId} topStatus=${topStatus} outputs=${JSON.stringify(outputStatuses)}`);
+
+    // Consider done when ALL outputs have individually completed (top-level status can lag)
+    const status = allDone
+      ? (outputStatuses.some(s => s === "Failed") ? "Failed" : "Completed")
+      : (topStatus === "Failed" ? "Failed" : "Generating");
+
+    const downloadUrls: string[] = [];
+    const downloads: Array<{ url: string; format: string; fileName: string }> = [];
+    if (status === "Completed") {
+      await Promise.all(outputs.map(async (o) => {
+        const outputId = String(o.id ?? o.Id ?? "");
+        const format  = String(o.format ?? o.Format ?? "pptx").toLowerCase();
+        const rawName = String(o.fileName ?? o.FileName ?? `output`);
+        const fileName = path.extname(rawName) ? rawName : `${rawName}.${format}`;
+        if (!outputId) return;
+        const dlResult = await handleGetDownloadUrl({ generatedLivedocId, outputId });
+        dbg(`dl outputId=${outputId} result=${JSON.stringify(dlResult)}`);
+        const dlBody = dlResult as Record<string, unknown>;
+        const url = String(dlBody.url ?? dlBody.downloadUrl ?? dlBody.Url ?? dlBody.DownloadUrl ?? "");
+        if (url) { downloadUrls.push(url); downloads.push({ url, format, fileName }); }
+      }));
+
+      // Update result file so get_panel_result (chat) can pick up the final URLs
+      let formToken = pendingGenerations.get(generatedLivedocId);
+      if (!formToken) {
+        const lookupPath = path.join(os.tmpdir(), `mcp-livedoc-gid-${generatedLivedocId}.json`);
+        if (fs.existsSync(lookupPath)) {
+          try { formToken = (JSON.parse(fs.readFileSync(lookupPath, "utf-8")) as { formToken: string }).formToken; } catch { /* ignore */ }
+        }
+      }
+      if (formToken) {
+        // Preserve templateName written by submit_form
+        let templateName = "";
+        const existingResultPath = path.join(os.tmpdir(), `mcp-livedoc-result-${formToken}.json`);
+        try { templateName = (JSON.parse(fs.readFileSync(existingResultPath, "utf-8")) as { templateName?: string }).templateName ?? ""; } catch { /* ignore */ }
+        fs.writeFileSync(
+          existingResultPath,
+          JSON.stringify({ generatedLivedocId, status: "Completed", downloadUrls, downloads, templateName }),
+          "utf-8"
+        );
+      }
+    }
+    return {
+      content: [{ type: "text" as const, text: status }],
+      structuredContent: { status, downloadUrls, downloads },
+    };
+  }
+);
+
+server.registerTool(
+  "download_output_file",
+  {
+    description: "Internal: downloads a generation output URL to the local Downloads folder and opens it. Called by the App panel download buttons.",
+    inputSchema: {
+      url: z.string(),
+      fileName: z.string().optional().describe("Suggested filename with extension, e.g. 'MyDoc.pptx'."),
+    },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async (args) => {
+    const { url, fileName } = args as { url: string; fileName?: string };
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        return { content: [{ type: "text" as const, text: `Download failed: HTTP ${res.status}` }], structuredContent: { error: `HTTP ${res.status}` } };
+      }
+      const buffer = await res.arrayBuffer();
+      const name = fileName || "livedoc-output.pptx";
+      const localPath = uniqueFilePath(getDownloadsDir(), name);
+      fs.writeFileSync(localPath, Buffer.from(buffer));
+      openWithDefaultApp(localPath);
+      return {
+        content: [{ type: "text" as const, text: `Saved to ${localPath}` }],
+        structuredContent: { localPath, success: true },
+      };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: `Error: ${e}` }], structuredContent: { error: String(e) } };
+    }
+  }
+);
+
+server.registerTool(
+  "get_candidate_thumbnails",
+  {
+    description: "Internal: fetches top-level thumbnail URLs for a batch of content candidates. Called by the App panel after form schema loads.",
+    inputSchema: {
+      teamSiteId: z.string(),
+      candidates: z.array(z.object({ contentId: z.string(), versionId: z.string() })),
+    },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async (args) => {
+    const { teamSiteId, candidates } = args as { teamSiteId: string; candidates: Array<{ contentId: string; versionId: string }> };
+    const results = await Promise.all(
+      candidates.map(async ({ contentId, versionId }) => {
+        if (!contentId || !versionId) return { versionId, thumbnailUrl: "" };
+        const res = await apiFetch("/v3/slides", {
+          method: "POST",
+          body: JSON.stringify({ teamSiteId, contentId, contentVersionId: versionId }),
+        });
+        if (res.status !== 200) return { versionId, thumbnailUrl: "" };
+        const body = res.body as Record<string, unknown>;
+        // imageUrl = top-level content thumbnail; contentThumbnailImageUrls[0] = first slide
+        const thumbnailUrl = String(
+          (body.contentThumbnailImageUrls as string[] | undefined)?.[0] ?? body.imageUrl ?? ""
+        );
+        return { versionId, thumbnailUrl };
+      })
+    );
+    const thumbnailMap: Record<string, string> = {};
+    for (const { versionId, thumbnailUrl } of results) {
+      if (thumbnailUrl) thumbnailMap[versionId] = thumbnailUrl;
+    }
+    return {
+      content: [{ type: "text" as const, text: `${Object.keys(thumbnailMap).length} thumbnails loaded` }],
+      structuredContent: { thumbnailMap },
+    };
+  }
+);
+
+server.registerTool(
+  "get_panel_result",
   {
     description:
-      "Wait (up to 10 minutes) for the user to fill and submit the LiveDoc input form. Returns the form payload — pass it directly to submit_livedoc_generation. Call this immediately after get_livedoc_inputs.",
+      "Get the result of the LiveDoc generation triggered from the App panel. " +
+      "Call this after the user says generation is done. Returns generatedLivedocId, status, downloads array, and templateName. " +
+      "IMPORTANT — when status is 'Completed': " +
+      "(1) Create an HTML artifact (type='text/html') showing a generation-complete card. " +
+      "The card must include: a green check icon, 'Generation complete' heading, templateName, 'Completed' badge, " +
+      "a DOWNLOADS section listing each file (icon by format, fileName, format label, a download arrow link to its url), " +
+      "and a small 'Links expire …' note at the bottom. Keep the HTML concise (no external resources). " +
+      "(2) Also call download_generation_output for each output to save the files locally. " +
+      "If status is still 'Generating', tell the user to wait and offer to check again.",
     inputSchema: {
-      token: z.string().describe("The form session token returned by get_livedoc_inputs."),
+      formToken: z.string().describe("The formToken returned by get_livedoc_inputs."),
     },
   },
   async (args) => {
-    const payload = await handleWaitForFormSubmit(args as { token: string });
+    const { formToken } = args as { formToken: string };
+    const resultPath = path.join(os.tmpdir(), `mcp-livedoc-result-${formToken}.json`);
+    if (!fs.existsSync(resultPath)) {
+      return {
+        content: [{ type: "text" as const, text: "No result yet — generation has not started or the form has not been submitted. Check the App panel." }],
+      };
+    }
+    const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as {
+      generatedLivedocId: string;
+      status: string;
+      downloadUrls: string[];
+      downloads?: Array<{ url: string; format: string; fileName: string }>;
+      templateName?: string;
+    };
+    const text = data.status === "Completed"
+      ? `Generation complete. templateName: "${data.templateName ?? ""}". generatedLivedocId: ${data.generatedLivedocId}. ` +
+        `downloads: ${JSON.stringify(data.downloads ?? [])}. ` +
+        `Create an HTML artifact showing the result card, then call download_generation_output for each output.`
+      : `Generation status: ${data.status}. generatedLivedocId: ${data.generatedLivedocId}. Check back shortly.`;
     return {
-      content: [{
-        type: "text" as const,
-        text: [
-          "Form submitted. NEXT: call submit_livedoc_generation immediately with this exact payload — do not modify it:",
-          JSON.stringify(payload, null, 2),
-        ].join("\n"),
-      }],
+      content: [{ type: "text" as const, text }],
+      structuredContent: data,
     };
   }
 );
@@ -1593,13 +1283,13 @@ server.registerTool(
           id: z.string().describe("Stable slot identifier — copy verbatim from get_livedoc_inputs."),
           name: z.string().optional(),
           contentType: z.string().describe("One of \"Group\", \"Section\", \"LiveSlide\", \"ResourcePDF\", etc."),
-          versionId: z.string().optional().describe("contentVersionId from wait_for_form_submit. Never populate yourself."),
+          versionId: z.string().optional().describe("contentVersionId from the pasted form payload. Never populate yourself."),
           sourceBlobId: z.string().optional(),
           pageNumber: z.number().optional(),
           isInclude: z.boolean(),
           orderIndex: z.number().optional(),
         })),
-      }).optional().describe("Content selection — pass ONLY what wait_for_form_submit returned."),
+      }).optional().describe("Content selection — pass ONLY what the pasted form payload contained."),
     },
   },
   async (args) => {
@@ -1653,7 +1343,9 @@ server.registerTool(
   "open_form_ui",
   {
     description:
-      "Opens the LiveDoc Form Web App for templates that require image uploads. Call this ONLY when get_livedoc_inputs explicitly instructs you to (hasImageUpload case). After submission, call get_form_result (NOT wait_for_form_submit) with the returned token.",
+      "DEPRECATED — DO NOT call this after get_livedoc_inputs. The form is now embedded in the App panel. " +
+      "get_livedoc_inputs already opens the panel form automatically. Calling this tool will open a redundant browser window. " +
+      "This tool is kept only as a last-resort fallback when the App panel is unavailable.",
     inputSchema: {
       teamSiteId: z.string().describe("Team site identifier (UUID)."),
       libraryContentVersionId: z.string().describe("Content version identifier (UUID) of the LiveDoc template."),

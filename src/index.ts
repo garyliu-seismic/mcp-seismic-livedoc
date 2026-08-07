@@ -571,8 +571,15 @@ async function handleSubmitGeneration(args: {
     return { error: `Generation submission failed (HTTP ${result.status})`, detail: result.body };
   }
   const body = result.body as Record<string, unknown>;
-  const generatedLivedocId =
-    (body.generatedLivedocId ?? body.id ?? body.GeneratedLivedocId ?? body.Id) as string | undefined;
+  // Walk every key looking for something that looks like a generated-livedoc UUID
+  const generatedLivedocId = (
+    body.generatedLivedocId ?? body.GeneratedLivedocId ??
+    body.id ?? body.Id ??
+    body.generatedId ?? body.GeneratedId ??
+    body.livedocId ?? body.LivedocId ??
+    // last resort: find any string value that looks like a UUID
+    Object.values(body).find(v => typeof v === "string" && /^[0-9a-f-]{36}$/i.test(v))
+  ) as string | undefined;
   return {
     generatedLivedocId,
     rawBody: body,
@@ -925,7 +932,25 @@ registerAppTool(
     }
 
     const formToken = generateToken();
-    const schema = buildFormSchema(ir, formToken);
+    const schema = buildFormSchema(ir, formToken) as Record<string, unknown> & {
+      slideGroups: Array<{ thumbnailUrl: string; [k: string]: unknown }>;
+    };
+
+    // Slide group thumbnailUrls are Seismic signed CDN URLs — the App panel iframe
+    // cannot load them cross-origin. Fetch server-side and inline as base64 data URLs.
+    await Promise.all(
+      (schema.slideGroups ?? []).map(async (g) => {
+        if (!g.thumbnailUrl) return;
+        try {
+          const res = await fetch(g.thumbnailUrl, { headers: authHeaders() as Record<string, string> });
+          if (!res.ok) return;
+          const buf = Buffer.from(await res.arrayBuffer());
+          const mime = res.headers.get("content-type") ?? "image/jpeg";
+          g.thumbnailUrl = `data:${mime};base64,${buf.toString("base64")}`;
+        } catch { /* leave original URL — panel will show broken img */ }
+      })
+    );
+
     pendingFormSchemas.set(formToken, schema);
     // Write to temp file so Process 2 (App panel) can read it
     fs.writeFileSync(
@@ -1138,7 +1163,15 @@ server.registerTool(
     }
     return {
       content: [{ type: "text" as const, text: status }],
-      structuredContent: { status, downloadUrls, downloads },
+      structuredContent: {
+        status, downloadUrls, downloads,
+        // Include per-output detail so the panel can show a meaningful failure reason
+        outputs: outputs.map(o => ({
+          format: String(o.format ?? o.Format ?? ""),
+          status: statusName(o.status ?? o.Status),
+          errorMessage: String(o.errorMessage ?? o.ErrorMessage ?? o.error ?? o.Error ?? ""),
+        })),
+      },
     };
   }
 );

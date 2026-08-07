@@ -293,7 +293,9 @@ function FormApp() {
   phaseRef.current = phase;
   React.useEffect(() => {
     const interval = setInterval(async () => {
-      if (phaseRef.current !== "done" && phaseRef.current !== "connecting") return;
+      // Only auto-reload in "connecting" (fresh panel that hasn't loaded a form yet).
+      // Do NOT reload in "done" — that would hijack an old panel and cause duplicate forms.
+      if (phaseRef.current !== "connecting") return;
       const app = appRef.current;
       if (!app) return;
       try {
@@ -428,7 +430,10 @@ function FormApp() {
       const sc = res?.structuredContent;
       const status = sc?.status ?? "Unknown";
       if (status === "Completed") return sc ?? {};
-      if (status === "Failed") throw new Error("Generation failed");
+      if (status === "Failed") {
+        const detail = sc?.outputs ? sc.outputs.map(o => `${o.format}: ${o.errorMessage ?? o.status}`).join("; ") : "";
+        throw new Error("Generation failed" + (detail ? ` — ${detail}` : ""));
+      }
     }
     throw new Error("Generation timed out after 4 minutes");
   }

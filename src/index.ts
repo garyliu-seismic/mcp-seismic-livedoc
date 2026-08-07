@@ -563,6 +563,9 @@ async function handleSubmitGeneration(args: {
     ? `?liveFormSellerTemplateId=${encodeURIComponent(args.liveFormSellerTemplateId)}`
     : "";
 
+  // Debug dump — readable at %TEMP%\mcp-livedoc-debug-submit.json after each Submit
+  try { fs.writeFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug-submit.json"), JSON.stringify(reqBody, null, 2)); } catch { /* ignore */ }
+
   const result = await apiFetch(
     `/v3/teamsites/${args.teamSiteId}/livedocVersions/${args.libraryContentVersionId}${qp}`,
     { method: "POST", body: JSON.stringify(reqBody) }

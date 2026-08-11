@@ -216,6 +216,7 @@ function FormApp() {
       const formToken = event?.structuredContent?.formToken;
       if (!formToken) return;
       tokenRef.current = formToken;
+      phaseRef.current = "loading"; // guard poll race before re-render
       setPhase("loading");
       try {
         const res = await app.callServerTool({ name: "get_form_schema", arguments: { token: formToken } });
@@ -305,8 +306,10 @@ function FormApp() {
         });
         const sc = res?.structuredContent;
         if (!sc?.isNew || !sc?.formToken) return;
+        if (phaseRef.current !== "connecting") return; // ontoolresult may have fired while awaiting
         // New generation request detected — load fresh schema
         tokenRef.current = sc.formToken;
+        phaseRef.current = "loading"; // guard concurrent poll ticks
         setPhase("loading");
         setErrMsg(null);
         setResult(null);
@@ -425,10 +428,16 @@ function FormApp() {
     const MAX = 80; // ~4 minutes at 3s interval
     for (let i = 0; i < MAX; i++) {
       await new Promise(r => setTimeout(r, 3000));
-      setPollMsg(`Generating… (${(i + 1) * 3}s)`);
       const res = await app.callServerTool({ name: "poll_generation", arguments: { generatedLivedocId: id } });
       const sc = res?.structuredContent;
       const status = sc?.status ?? "Unknown";
+      const elapsed = `${(i + 1) * 3}s`;
+      if (sc?.outputs?.length) {
+        const parts = sc.outputs.map(o => `${o.format}: ${o.status}`).join("  ·  ");
+        setPollMsg(`${parts}  (${elapsed})`);
+      } else {
+        setPollMsg(`Generating… (${elapsed})`);
+      }
       if (status === "Completed") return sc ?? {};
       if (status === "Failed") {
         const detail = sc?.outputs ? sc.outputs.map(o => `${o.format}: ${o.errorMessage ?? o.status}`).join("; ") : "";

@@ -275,7 +275,8 @@ function FormApp() {
   const [grpInc,   setGrpInc]   = useState({});   // { groupId: bool }
   const [extSel,   setExtSel]   = useState({});   // { slotId: Set<versionId> }
   const [previewImg, setPreviewImg] = useState(null); // { images: [{url,title}], idx } for lightbox
-  const [previews,   setPreviews]   = useState([]);    // [{ format, images: [{index,url}] }]
+  const [previews,        setPreviews]        = useState([]);    // [{ format, images: [{index,url}] }]
+  const [previewsFetched, setPreviewsFetched] = useState(false); // true once fetchPreviews resolves
   const [thumbs,         setThumbs]         = useState({});   // { versionId: thumbnailUrl }
   const [manualOutputFmts, setManualOutputFmts] = useState(["PPTX"]); // fallback when API has no output defs
   const [fmtIdx,   setFmtIdx]   = useState(0);    // selected formOption index
@@ -505,24 +506,28 @@ function FormApp() {
 
   async function fetchPreviews(app, generatedLivedocId, downloads) {
     const previewable = (downloads ?? []).filter(d => ["pptx", "pdf"].includes((d.format ?? "").toLowerCase()));
-    if (!previewable.length) return;
-    const results = await Promise.all(previewable.map(async d => {
-      try {
-        const res = await app.callServerTool({
-          name: "get_preview_images",
-          arguments: { generatedLivedocId, outputId: d.format.toLowerCase() },
-        });
-        const images = (res?.structuredContent?.images ?? [])
-          .filter(img => typeof img.url === "string" && img.url.startsWith("https://"));
-        return { format: d.format.toUpperCase(), images };
-      } catch {
-        return { format: d.format.toUpperCase(), images: [] };
+    if (!previewable.length) { setPreviewsFetched(true); return; }
+    try {
+      const results = await Promise.all(previewable.map(async d => {
+        try {
+          const res = await app.callServerTool({
+            name: "get_preview_images",
+            arguments: { generatedLivedocId, outputId: d.format.toLowerCase() },
+          });
+          const images = (res?.structuredContent?.images ?? [])
+            .filter(img => typeof img.url === "string" && img.url.startsWith("https://"));
+          return { format: d.format.toUpperCase(), images };
+        } catch {
+          return { format: d.format.toUpperCase(), images: [] };
+        }
+      }));
+      const nonempty = results.filter(r => r.images.length > 0);
+      if (nonempty.length > 0) {
+        setPreviews(nonempty);
+        appRef.current?.sendSizeChanged({ width: 520, height: 820 });
       }
-    }));
-    const nonempty = results.filter(r => r.images.length > 0);
-    if (nonempty.length > 0) {
-      setPreviews(nonempty);
-      appRef.current?.sendSizeChanged({ width: 520, height: 820 });
+    } finally {
+      setPreviewsFetched(true);
     }
   }
 
@@ -549,6 +554,7 @@ function FormApp() {
       const dls = pollResult.downloads ?? [];
       setResult({ generatedLivedocId, downloadUrls: pollResult.downloadUrls ?? [], downloads: dls });
       setPreviews([]);
+      setPreviewsFetched(false);
       setPhase("done");
       app.sendSizeChanged({ width: 520, height: 500 });
       fetchPreviews(app, generatedLivedocId, dls);
@@ -623,7 +629,7 @@ function FormApp() {
           }
         </div>
 
-        {previews.length === 0 && downloads.some(d => ["pptx","pdf"].includes((d.format??"").toLowerCase())) && (
+        {!previewsFetched && downloads.some(d => ["pptx","pdf"].includes((d.format??"").toLowerCase())) && (
           <div style={{ marginTop: 12, color: "#888", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ ...S.spinner, borderColor: "#ccc", borderTopColor: "#888" }} />
             Loading preview…

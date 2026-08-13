@@ -74,6 +74,77 @@ const S = {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
+function LoginForm({ app, onSubmit, busy, error }) {
+  const [tenant,   setTenant]   = React.useState("");
+  const [username, setUsername] = React.useState("");
+  const [password, setPassword] = React.useState("");
+
+  React.useEffect(() => {
+    app.callServerTool({ name: "get_auth_config", arguments: {} }).then(res => {
+      const sc = res?.structuredContent;
+      if (sc?.tenant)   setTenant(sc.tenant);
+    }).catch(() => {});
+  }, []);
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (!tenant || !username || !password || busy) return;
+    onSubmit(tenant, username, password);
+  }
+  const canSubmit = tenant && username && password && !busy;
+  return (
+    <div style={{ ...S.page, display: "flex", flexDirection: "column", gap: 0 }}>
+      <div style={S.title}>Sign in to Seismic</div>
+      <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 12, maxWidth: 340 }}>
+        <div style={S.fw}>
+          <label style={S.fl}>Tenant</label>
+          <input
+            style={S.fi}
+            type="text"
+            placeholder="e.g. sttqaf12"
+            value={tenant}
+            onChange={e => setTenant(e.target.value)}
+            disabled={busy}
+          />
+        </div>
+        <div style={S.fw}>
+          <label style={S.fl}>Username</label>
+          <input
+            style={S.fi}
+            type="text"
+            autoComplete="username"
+            value={username}
+            onChange={e => setUsername(e.target.value)}
+            disabled={busy}
+          />
+        </div>
+        <div style={S.fw}>
+          <label style={S.fl}>Password</label>
+          <input
+            style={S.fi}
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            disabled={busy}
+          />
+        </div>
+        {error && <div style={S.errBox}>{error}</div>}
+        <button
+          type="submit"
+          disabled={!canSubmit}
+          style={{ ...S.sub, opacity: canSubmit ? 1 : 0.6, cursor: busy ? "wait" : "pointer" }}
+        >
+          {busy
+            ? <><span style={{ ...S.spinner, borderColor: "#fff", borderTopColor: "transparent" }} />Signing in…</>
+            : "Sign in"
+          }
+        </button>
+      </form>
+    </div>
+  );
+}
+
 function DownloadButton({ app, url, fileName, label }) {
   const [state, setState] = React.useState("idle"); // idle | saving | done | error
   const [msg,   setMsg]   = React.useState("");
@@ -190,7 +261,7 @@ function FormApp() {
   const appRef   = useRef(null);
   const tokenRef = useRef(null);
 
-  const [phase,    setPhase]    = useState("connecting"); // connecting|loading|ready|submitting|polling|done|error
+  const [phase,    setPhase]    = useState("connecting"); // connecting|login|loading|ready|submitting|polling|done|error
   const [schema,   setSchema]   = useState(null);
   const [errMsg,   setErrMsg]   = useState(null);
   const [result,   setResult]   = useState(null);    // { generatedLivedocId, downloadUrls }
@@ -203,16 +274,42 @@ function FormApp() {
   const [vlTables, setVlTables] = useState({});   // { "vl|tableName": [rows] }
   const [grpInc,   setGrpInc]   = useState({});   // { groupId: bool }
   const [extSel,   setExtSel]   = useState({});   // { slotId: Set<versionId> }
+  const [previewImg, setPreviewImg] = useState(null); // { url, title } for lightbox
   const [thumbs,         setThumbs]         = useState({});   // { versionId: thumbnailUrl }
   const [manualOutputFmts, setManualOutputFmts] = useState(["PPTX"]); // fallback when API has no output defs
   const [fmtIdx,   setFmtIdx]   = useState(0);    // selected formOption index
   const [comboIdx, setComboIdx] = useState(0);    // selected outputCombo index within form
+
+  const [loginError, setLoginError] = useState(null);
+  const [loginBusy,  setLoginBusy]  = useState(false);
+
+  async function handlePanelLogin(tenant, username, password) {
+    setLoginBusy(true);
+    setLoginError(null);
+    try {
+      const res = await appRef.current.callServerTool({ name: "panel_login", arguments: { tenant, username, password } });
+      const sc = res?.structuredContent;
+      if (sc?.ok) {
+        setPhase("connecting");
+      } else {
+        setLoginError(sc?.error ?? "Login failed. Check your credentials.");
+      }
+    } catch (e) {
+      setLoginError(String(e));
+    } finally {
+      setLoginBusy(false);
+    }
+  }
 
   useEffect(() => {
     const app = new App({ name: "livedoc-form", version: "1.0.0" }, {});
     appRef.current = app;
 
     app.ontoolresult = async (event) => {
+      // open_livedoc_panel signals the panel to show login or ready state
+      if (event?.structuredContent?.action === "show_login") { setPhase("login"); return; }
+      if (event?.structuredContent?.action === "ready") { /* already authenticated — stay in connecting */ return; }
+
       const formToken = event?.structuredContent?.formToken;
       if (!formToken) return;
       tokenRef.current = formToken;
@@ -284,7 +381,11 @@ function FormApp() {
     };
 
     app.connect()
-      .then(() => { /* stay in connecting until ontoolresult fires */ })
+      .then(() => {
+        app.callServerTool({ name: "get_auth_status", arguments: {} }).then(res => {
+          if (!res?.structuredContent?.isAuthenticated) setPhase("login");
+        }).catch(() => { /* if status check fails, stay in connecting */ });
+      })
       .catch(e => { setErrMsg(String(e)); setPhase("error"); });
   }, []);
 
@@ -300,6 +401,10 @@ function FormApp() {
       const app = appRef.current;
       if (!app) return;
       try {
+        // Re-check auth on every tick so an expired token surfaces the login form.
+        const authRes = await app.callServerTool({ name: "get_auth_status", arguments: {} });
+        if (!authRes?.structuredContent?.isAuthenticated) { setPhase("login"); return; }
+
         const res = await app.callServerTool({
           name: "get_latest_token",
           arguments: { currentToken: tokenRef.current ?? "" },
@@ -458,6 +563,10 @@ function FormApp() {
     );
   }
 
+  if (phase === "login") {
+    return <LoginForm app={appRef.current} onSubmit={handlePanelLogin} busy={loginBusy} error={loginError} />;
+  }
+
   if (phase === "error") {
     return <div style={S.page}><div style={S.errBox}><b>Error:</b> {errMsg}</div></div>;
   }
@@ -553,7 +662,19 @@ function FormApp() {
       {/* ── Slide groups ── */}
       {slideGroups.length > 0 && (
         <div style={S.section}>
-          <div style={S.sl}>Content selection</div>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={S.sl}>Content selection</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => setGrpInc(p => Object.fromEntries(Object.keys(p).map(k => [k, true])))}
+                style={{ fontSize: 11, color: "#0066cc", background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}>
+                Select all
+              </button>
+              <button onClick={() => setGrpInc(p => Object.fromEntries(Object.keys(p).map(k => [k, false])))}
+                style={{ fontSize: 11, color: "#0066cc", background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}>
+                Unselect all
+              </button>
+            </div>
+          </div>
           {slideGroups.some(g => g.thumbnailUrl)
             ? <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
                 {slideGroups.map(g => {
@@ -566,6 +687,11 @@ function FormApp() {
                         style={{ width: "100%", height: 90, objectFit: "cover", display: "block" }} />
                       <div style={{ padding: "5px 7px", fontSize: 11, fontWeight: 600, color: "#333", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.name}</div>
                       {on && <div style={{ position: "absolute", top: 4, right: 4, background: "#0066cc", color: "#fff", borderRadius: "50%", width: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11 }}>✓</div>}
+                      <button onClick={e => { e.stopPropagation(); setPreviewImg({ url: g.thumbnailUrl, title: g.name }); }}
+                        title="Preview"
+                        style={{ position: "absolute", bottom: 28, right: 4, background: "rgba(0,0,0,0.45)", border: "none", borderRadius: "50%", width: 22, height: 22, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "#fff", fontSize: 12, lineHeight: 1 }}>
+                        👁
+                      </button>
                     </div>
                   );
                 })}
@@ -587,7 +713,21 @@ function FormApp() {
           <div style={S.sl}>External content</div>
           {externalContent.map(slot => (
             <div key={slot.id} style={S.extItem}>
-              <div style={{ ...S.fl, marginBottom: 8 }}>{slot.name}</div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <div style={S.fl}>{slot.name}</div>
+                {slot.candidates.length > 0 && (
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => setExtSel(p => ({ ...p, [slot.id]: new Set(slot.candidates.map(c => c.versionId)) }))}
+                      style={{ fontSize: 11, color: "#0066cc", background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}>
+                      Select all
+                    </button>
+                    <button onClick={() => setExtSel(p => ({ ...p, [slot.id]: new Set() }))}
+                      style={{ fontSize: 11, color: "#0066cc", background: "none", border: "none", cursor: "pointer", padding: "2px 4px" }}>
+                      Unselect all
+                    </button>
+                  </div>
+                )}
+              </div>
               {slot.candidates.length === 0
                 ? <div style={{ fontSize: 12, color: "#888" }}>No candidates found</div>
                 : <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
@@ -709,6 +849,22 @@ function FormApp() {
       )}
 
       <button onClick={handleSubmit} style={S.sub}>▶ Submit generation</button>
+
+      {/* ── Lightbox ── */}
+      {previewImg && (
+        <div onClick={() => setPreviewImg(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999,
+            display: "flex", alignItems: "center", justifyContent: "center", cursor: "zoom-out" }}>
+          <div onClick={e => e.stopPropagation()}
+            style={{ position: "relative", maxWidth: "90vw", maxHeight: "90vh" }}>
+            <img src={previewImg.url} alt={previewImg.title}
+              style={{ display: "block", maxWidth: "90vw", maxHeight: "85vh", borderRadius: 6, boxShadow: "0 8px 40px rgba(0,0,0,0.5)" }} />
+            <div style={{ textAlign: "center", color: "#fff", fontSize: 13, marginTop: 8, fontWeight: 600 }}>{previewImg.title}</div>
+            <button onClick={() => setPreviewImg(null)}
+              style={{ position: "absolute", top: -12, right: -12, background: "#fff", border: "none", borderRadius: "50%", width: 26, height: 26, cursor: "pointer", fontSize: 14, fontWeight: 700, lineHeight: "26px" }}>✕</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

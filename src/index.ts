@@ -43,12 +43,16 @@ const COWORK_PATH = process.env.CLAUDE_COWORK_PATH || findCoworkPath();
 
 const BASE_URL = process.env.SEISMIC_BASE_URL ?? "https://api.seismic.com/livedoc";
 
-const DEFAULT_AUTH_URI      = process.env.AUTH_SERVICE_URI    ?? "";
-const DEFAULT_AUTH_TENANT   = process.env.AUTH_TENANT         ?? "";
-const DEFAULT_CLIENT_ID     = process.env.AUTH_CLIENT_ID      ?? "";
-const DEFAULT_CLIENT_SECRET = process.env.AUTH_CLIENT_SECRET  ?? "";
-const DEFAULT_USERNAME      = process.env.AUTH_USERNAME        ?? "";
-const DEFAULT_PASSWORD      = process.env.AUTH_PASSWORD        ?? "";
+const DEFAULT_AUTH_URI    = process.env.AUTH_SERVICE_URI ?? "https://auth-qa.seismic-dev.com";
+const DEFAULT_AUTH_TENANT = process.env.AUTH_TENANT      ?? "";
+const DEFAULT_USERNAME    = process.env.AUTH_USERNAME    ?? "";
+const DEFAULT_PASSWORD    = process.env.AUTH_PASSWORD    ?? "";
+
+// Public DocCenter web client — works across all tenants, no secret required.
+const BROWSER_CLIENT_ID = "0188a34d-cdbd-4208-8ebc-d0567984915e";
+const BROWSER_SCOPES    = "openid id library download engagement_read engagement_write upload " +
+  "feature_read collection_read contentdiscovery doccenter_backend_read livedoc " +
+  "ums_bff_read das_data_rw email profile entitlement_read aiml_llm";
 
 const pendingFormSchemas  = new Map<string, unknown>(); // token → normalised form schema for get_form_schema
 const pendingGenerations  = new Map<string, string>();  // generatedLivedocId → formToken (Process 2 only)
@@ -58,12 +62,35 @@ let currentToken = process.env.SEISMIC_API_TOKEN ?? "";
 // 401-triggered autoLogin() so it can never clobber a hand-picked token with a
 // narrower-scoped one obtained from the default credential-flow login.
 let tokenIsManual = false;
+// Credentials entered via the panel login form — cached in memory so the 401
+// auto-refresh path can obtain a fresh token without env vars being set.
+let cachedTenant   = DEFAULT_AUTH_TENANT;
+let cachedUsername = DEFAULT_USERNAME;
+let cachedPassword = DEFAULT_PASSWORD;
 
-// Scopes requested by the credential-flow login (login tool + autoLogin refresh).
-// Must include seismic.library.view/manage — search endpoints reject tokens
-// without them ("Invalid or missing user claim"), even though generation
-// endpoints are fine with just livedoc/library.
-const LOGIN_SCOPE = "library livedoc seismic.library.view seismic.library.manage";
+// ── Token persistence ───────────────────────────────────────────────────────
+// Panel-login tokens are stored here so they survive MCP server restarts.
+const TOKEN_FILE = path.join(os.tmpdir(), "mcp-livedoc-token.json");
+const DEBUG_LOG  = path.join(os.tmpdir(), "mcp-livedoc-debug.log");
+
+function dbg(msg: string): void {
+  try { fs.appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+}
+
+function saveToken(token: string): void {
+  try { fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token }), "utf-8"); } catch (e) { dbg(`saveToken error: ${e}`); }
+}
+
+function loadSavedToken(): string {
+  try {
+    const { token } = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf-8")) as { token: string };
+    if (!token) return "";
+    const exp = jwtExpiresAt(token);
+    if (exp !== null && Date.now() >= exp - 60_000) { dbg("loadSavedToken: found token but it is expired, skipping"); return ""; }
+    dbg(`loadSavedToken: loaded valid token (expires ${exp ? new Date(exp).toISOString() : "never"})`);
+    return token;
+  } catch { return ""; }
+}
 
 function authHeaders(): Record<string, string> {
   return {
@@ -72,31 +99,83 @@ function authHeaders(): Record<string, string> {
   };
 }
 
+function cookieStr(headers: Headers): string {
+  const cookies = (headers as unknown as { getSetCookie?(): string[] }).getSetCookie?.() ?? [];
+  return cookies.map(c => c.split(";")[0]).join("; ");
+}
+
+async function browserLogin(tenant: string, username: string, password: string, authUri = DEFAULT_AUTH_URI): Promise<string> {
+  const authBase    = `${authUri}/tenants/${encodeURIComponent(tenant)}`;
+  const redirectUri = `https://${tenant}.seismic.com/app`;
+  const state    = randomUUID().replace(/-/g, "");
+  const nonce    = randomUUID().replace(/-/g, "");
+  const appState = randomUUID().replace(/-/g, "");
+
+  const params = new URLSearchParams({
+    client_id: BROWSER_CLIENT_ID, response_type: "id_token token", scope: BROWSER_SCOPES,
+    state, redirect_uri: `${redirectUri}?state=${appState}`,
+    response_mode: "form_post", nonce, themeMode: "light",
+  });
+
+  dbg(`browserLogin: step1 tenant=${tenant} authBase=${authBase}`);
+  // Step 1: GET /connect/authorize with redirect:manual — the session cookie is on this first
+  // 302 response itself. We do NOT follow the redirect (it goes to the tenant login page which
+  // may be unreachable). The cookie from this response is all we need for step 2.
+  const step1 = await fetch(`${authBase}/connect/authorize?${params}`, {
+    redirect: "manual",
+    headers: { "User-Agent": "Mozilla/5.0" },
+  }).catch(e => { throw new Error(`Step 1 (authorize) network error: ${e}`); });
+  const cookies1 = cookieStr(step1.headers);
+  dbg(`browserLogin: step1 status=${step1.status} cookies=${cookies1 ? cookies1.slice(0, 80) : "(none)"}`);
+  if (!cookies1) throw new Error(`Step 1 (authorize) returned no cookies (status ${step1.status}). Auth server may be unreachable or the client_id is not registered for this tenant.`);
+
+  // Step 2: POST credentials
+  const loginRes = await fetch(`${authBase}/api/v1/account/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": "Mozilla/5.0", Cookie: cookies1 },
+    body: JSON.stringify({ Username: username, Password: password, RememberMe: false, ClientId: BROWSER_CLIENT_ID, ClientVersion: "", DisableSingleSignOn: false }),
+  }).catch(e => { throw new Error(`Step 2 (login POST) fetch error: ${e}`); });
+  const loginData = await loginRes.json() as { isSuccess: boolean };
+  dbg(`browserLogin: step2 status=${loginRes.status} isSuccess=${loginData.isSuccess}`);
+  if (!loginData.isSuccess) throw new Error("Seismic login failed — check username/password");
+  const cookies2 = [cookies1, cookieStr(loginRes.headers)].filter(Boolean).join("; ");
+
+  // Step 3: callback — token is in the HTML form response
+  const cbRes = await fetch(`${authBase}/connect/authorize/callback?${params}`, {
+    redirect: "manual",
+    headers: { "User-Agent": "Mozilla/5.0", Cookie: cookies2, Accept: "text/html" },
+  }).catch(e => { throw new Error(`Step 3 (callback) fetch error: ${e}`); });
+  const html = await cbRes.text();
+  const m = html.match(/name=['"]access_token['"]\s+value=['"]([^'"]+)['"]/)
+    ?? html.match(/value=['"]([^'"]+)['"]\s+name=['"]access_token['"]/);
+  dbg(`browserLogin: step3 status=${cbRes.status} tokenFound=${!!m} bodySnippet=${html.slice(0, 100)}`);
+  if (!m) throw new Error(`Could not extract access_token. Callback status: ${cbRes.status}, body snippet: ${html.slice(0, 200)}`);
+  return m[1];
+}
+
 async function autoLogin(): Promise<boolean> {
-  if (!DEFAULT_AUTH_URI || !DEFAULT_AUTH_TENANT || !DEFAULT_CLIENT_ID || !DEFAULT_USERNAME || !DEFAULT_PASSWORD) return false;
+  const tenant   = cachedTenant   || DEFAULT_AUTH_TENANT;
+  const username = cachedUsername || DEFAULT_USERNAME;
+  const password = cachedPassword || DEFAULT_PASSWORD;
+  if (!tenant || !username || !password) return false;
+  dbg(`autoLogin: attempting tenant=${tenant} user=${username}`);
   try {
-    const body = new URLSearchParams({
-      grant_type:    "client_credentials",
-      client_id:     DEFAULT_CLIENT_ID,
-      client_secret: DEFAULT_CLIENT_SECRET,
-      username:      DEFAULT_USERNAME,
-      password:      DEFAULT_PASSWORD,
-      scope:         LOGIN_SCOPE,
-    });
-    const res = await fetch(`${DEFAULT_AUTH_URI}/tenants/${encodeURIComponent(DEFAULT_AUTH_TENANT)}/connect/token`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body:    body.toString(),
-    });
-    if (!res.ok) return false;
-    const data = await res.json() as Record<string, unknown>;
-    if (!data.access_token) return false;
-    currentToken = data.access_token as string;
+    currentToken = await browserLogin(tenant, username, password);
     tokenIsManual = false;
+    saveToken(currentToken);
+    dbg(`autoLogin: success`);
     return true;
-  } catch {
+  } catch (e) {
+    dbg(`autoLogin: failed — ${e}`);
     return false;
   }
+}
+
+function jwtExpiresAt(token: string): number | null {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString());
+    return typeof payload.exp === "number" ? payload.exp * 1000 : null;
+  } catch { return null; }
 }
 
 async function apiFetch(
@@ -109,12 +188,28 @@ async function apiFetch(
     ...options,
     headers: { ...authHeaders(), ...(options.headers as Record<string, string> ?? {}) },
   });
-  // Auto-refresh token on 401 when env credentials are available — but never when the
-  // current token was explicitly set via set_token, so we don't silently replace a
-  // hand-picked (possibly broader-scoped) token with a narrower credential-flow one.
-  if (res.status === 401 && _retry && !tokenIsManual && DEFAULT_USERNAME && DEFAULT_PASSWORD) {
-    const refreshed = await autoLogin();
-    if (refreshed) return apiFetch(path, options, false);
+  // Auto-refresh token on 401/403 — but never when the token was explicitly set via set_token.
+  // 403 "Request not allowed" from Seismic typically means an expired or wrong-scope token.
+  // First: try loading a token saved by the panel process (cross-process panel login).
+  // Then: try auto-login with cached credentials (env vars or from a previous panel login).
+  if ((res.status === 401 || res.status === 403) && _retry && !tokenIsManual) {
+    const savedToken = loadSavedToken();
+    if (savedToken && savedToken !== currentToken) {
+      currentToken = savedToken;
+      dbg(`apiFetch: picked up saved token after ${res.status}, retrying`);
+      return apiFetch(path, options, false);
+    }
+    const hasCreds = !!(cachedUsername || DEFAULT_USERNAME) && !!(cachedPassword || DEFAULT_PASSWORD);
+    if (hasCreds) {
+      const refreshed = await autoLogin();
+      if (refreshed) return apiFetch(path, options, false);
+    }
+  }
+  if (res.status === 401 || res.status === 403) {
+    return {
+      status: res.status,
+      body: `Authentication failed (HTTP ${res.status} — token expired or missing). The user must sign in via the LiveDoc panel before this action can proceed. Do not call open_form_ui. Do not ask the user for credentials.`,
+    };
   }
   const text = await res.text();
   let body: unknown;
@@ -189,8 +284,8 @@ async function handleSearchTemplates(args: {
     }>;
   };
   return {
-    totalCount: data.totalCount,
-    results: data.documents.map((d) => ({
+    totalCount: data.totalCount ?? 0,
+    results: (data.documents ?? []).map((d) => ({
       title: d.title,
       format: d.format,
       contentVersionId: d.contentVersionId,
@@ -245,8 +340,8 @@ async function handleSearchContent(args: {
     }>;
   };
   return {
-    totalCount: data.totalCount,
-    results: data.documents.map((d) => ({
+    totalCount: data.totalCount ?? 0,
+    results: (data.documents ?? []).map((d) => ({
       id: d.contentVersionId,
       name: d.title,
       format: d.format,
@@ -612,7 +707,8 @@ async function handleGetStatus(args: { generatedLivedocId: string }) {
   }
   const raw = result.body as Record<string, unknown>;
   const id = (raw.id ?? raw.Id ?? raw.generatedLivedocId ?? raw.GeneratedLivedocId) as string;
-  const rawOutputs = (raw.outputs ?? raw.Outputs ?? []) as Array<Record<string, unknown>>;
+  const rawOutputs = ((raw.outputs ?? raw.Outputs ?? []) as Array<Record<string, unknown>>)
+    .filter(o => String(o.format ?? o.Format ?? "").toLowerCase() !== "thumbnail");
   const outputs = rawOutputs.map((o) => ({
     id: (o.id ?? o.Id) as string,
     status: statusName(o.status ?? o.Status),
@@ -802,54 +898,34 @@ async function handleGetFormResult(args: { token: string }) {
 }
 
 async function handleLogin(args: {
+  tenant?: string;
   username?: string;
   password?: string;
-  tenant?: string;
-  authServiceUri?: string;
-  clientId?: string;
-  clientSecret?: string;
 }): Promise<{ ok: boolean; message: string } | { error: string; detail: unknown }> {
-  const authUri  = args.authServiceUri ?? DEFAULT_AUTH_URI;
-  const tenant   = args.tenant         ?? DEFAULT_AUTH_TENANT;
-  const clientId     = args.clientId     ?? DEFAULT_CLIENT_ID;
-  const clientSecret = args.clientSecret ?? DEFAULT_CLIENT_SECRET;
+  const tenant   = args.tenant   ?? DEFAULT_AUTH_TENANT;
   const username = args.username ?? DEFAULT_USERNAME;
   const password = args.password ?? DEFAULT_PASSWORD;
 
-  if (!authUri)  return { error: "authServiceUri is required (set AUTH_SERVICE_URI env var or pass authServiceUri).", detail: null };
   if (!tenant)   return { error: "tenant is required (set AUTH_TENANT env var or pass tenant).", detail: null };
-  if (!clientId) return { error: "clientId is required (set AUTH_CLIENT_ID env var or pass clientId).", detail: null };
-  if (!username) return { error: "username is required (set AUTH_USERNAME env var or pass username).", detail: null };
-  if (!password) return { error: "password is required (set AUTH_PASSWORD env var or pass password).", detail: null };
+  if (!username) return { error: "username is required.", detail: null };
+  if (!password) return { error: "password is required.", detail: null };
 
-  const tokenUrl = `${authUri}/tenants/${encodeURIComponent(tenant)}/connect/token`;
-  const body = new URLSearchParams({
-    grant_type:    "client_credentials",
-    client_id:     clientId,
-    client_secret: clientSecret,
-    username,
-    password,
-    scope:         LOGIN_SCOPE,
-  });
-
-  const res = await fetch(tokenUrl, {
-    method:  "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body:    body.toString(),
-  });
-
-  const text = await res.text();
-  let data: Record<string, unknown>;
-  try { data = JSON.parse(text) as Record<string, unknown>; } catch { return { error: `Auth server returned non-JSON (HTTP ${res.status})`, detail: text }; }
-
-  if (!res.ok || !data.access_token) {
-    return { error: `Login failed (HTTP ${res.status})`, detail: data };
+  dbg(`handleLogin: attempting login tenant=${tenant} user=${username}`);
+  try {
+    currentToken = await browserLogin(tenant, username, password);
+    tokenIsManual = false;
+    saveToken(currentToken);
+    // Cache credentials so the 401 auto-refresh path can re-login without env vars.
+    cachedTenant   = tenant;
+    cachedUsername = username;
+    cachedPassword = password;
+    const exp = jwtExpiresAt(currentToken);
+    dbg(`handleLogin: success — token set, expires=${exp ? new Date(exp).toISOString() : "unknown"}`);
+    return { ok: true, message: "Token obtained successfully. All tools are now authenticated." };
+  } catch (e) {
+    dbg(`handleLogin: failed — ${e}`);
+    return { error: String(e), detail: null };
   }
-
-  currentToken = data.access_token as string;
-  tokenIsManual = false;
-  const expiresIn = data.expires_in as number | undefined;
-  return { ok: true, message: `Token obtained successfully${expiresIn ? ` (expires in ${expiresIn}s)` : ""}. All tools are now authenticated.` };
 }
 
 // ── Server wiring ───────────────────────────────────────────────────────────
@@ -867,7 +943,22 @@ registerAppResource(
   () => {
     const shellPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "views", "form-shell.html");
     const text = fs.readFileSync(shellPath, "utf-8");
-    return { contents: [{ uri: FORM_RESOURCE_URI, mimeType: RESOURCE_MIME_TYPE, text }] };
+    return {
+      contents: [{
+        uri: FORM_RESOURCE_URI,
+        mimeType: RESOURCE_MIME_TYPE,
+        text,
+        _meta: {
+          ui: {
+            csp: {
+              // Allow loading slide group thumbnail images from Seismic download CDN.
+              // These are signed URLs on download-*-edge.seismic-dev.com / seismic.com.
+              resourceDomains: ["https://*.seismic-dev.com", "https://*.seismic.com"],
+            },
+          },
+        },
+      }],
+    };
   }
 );
 
@@ -909,6 +1000,50 @@ server.registerTool(
   }
 );
 
+// open_livedoc_panel — opens the App panel so the user can sign in or check status
+registerAppTool(
+  server,
+  "open_livedoc_panel",
+  {
+    description:
+      "Open the LiveDoc App panel for sign-in. ONLY call this when a tool explicitly returns an HTTP 401 error, or when the user explicitly asks to log in. " +
+      "Do NOT call this proactively before attempting any tool — always try the actual tool first and react to failures. " +
+      "IMPORTANT: After calling this tool, you MUST stop and tell the user to sign in via the panel, then WAIT. " +
+      "Do NOT call any other tools until the user sends a follow-up message confirming they have signed in. " +
+      "Do NOT ask the user for credentials — the panel has its own sign-in form.",
+    inputSchema: {},
+    _meta: { ui: { resourceUri: FORM_RESOURCE_URI } },
+  },
+  async () => {
+    const exp = currentToken ? jwtExpiresAt(currentToken) : null;
+    const isAuthenticated = !!currentToken && (exp === null || Date.now() < exp - 60_000);
+    return {
+      content: [{ type: "text" as const, text: isAuthenticated
+        ? "Panel opened. The user is already signed in — proceed with their request."
+        : "Panel opened showing the sign-in form. STOP HERE. Tell the user to fill in their credentials in the panel and click Sign in. Do not call any other tool until the user confirms they have signed in.",
+      }],
+      structuredContent: { action: isAuthenticated ? "ready" : "show_login" },
+    };
+  }
+);
+
+server.registerTool(
+  "check_auth",
+  {
+    description: "Internal: check auth status. Called by the App panel only.",
+    inputSchema: {},
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async () => {
+    const exp = currentToken ? jwtExpiresAt(currentToken) : null;
+    const isAuthenticated = !!currentToken && (exp === null || Date.now() < exp - 60_000);
+    return {
+      content: [{ type: "text" as const, text: isAuthenticated ? "Authenticated — token is valid." : "Not authenticated — token is missing or expired. Call open_livedoc_panel and wait for the user to sign in." }],
+      structuredContent: { isAuthenticated, expiresAt: exp ?? null },
+    };
+  }
+);
+
 // get_livedoc_inputs — opens the MCP App panel with the form
 registerAppTool(
   server,
@@ -939,20 +1074,10 @@ registerAppTool(
       slideGroups: Array<{ thumbnailUrl: string; [k: string]: unknown }>;
     };
 
-    // Slide group thumbnailUrls are Seismic signed CDN URLs — the App panel iframe
-    // cannot load them cross-origin. Fetch server-side and inline as base64 data URLs.
-    await Promise.all(
-      (schema.slideGroups ?? []).map(async (g) => {
-        if (!g.thumbnailUrl) return;
-        try {
-          const res = await fetch(g.thumbnailUrl, { headers: authHeaders() as Record<string, string> });
-          if (!res.ok) return;
-          const buf = Buffer.from(await res.arrayBuffer());
-          const mime = res.headers.get("content-type") ?? "image/jpeg";
-          g.thumbnailUrl = `data:${mime};base64,${buf.toString("base64")}`;
-        } catch { /* leave original URL — panel will show broken img */ }
-      })
-    );
+    // External content candidate thumbnails are fetched lazily by the panel via
+    // get_candidate_thumbnails (which inlines them server-side). Do NOT pre-fetch
+    // them here — there can be 30+ candidates and the per-image timeout would stall
+    // get_livedoc_inputs unacceptably.
 
     pendingFormSchemas.set(formToken, schema);
     // Write to temp file so Process 2 (App panel) can read it
@@ -965,7 +1090,7 @@ registerAppTool(
     // even when the App panel was already open from a previous run.
     fs.writeFileSync(
       path.join(os.tmpdir(), `mcp-livedoc-latest-token.json`),
-      JSON.stringify({ formToken }),
+      JSON.stringify({ formToken, writtenAt: Date.now() }),
       "utf-8"
     );
 
@@ -998,6 +1123,75 @@ server.registerTool(
 );
 
 server.registerTool(
+  "get_auth_status",
+  {
+    description: "Internal: returns whether the server currently holds a valid, non-expired bearer token. Called by the App panel on startup.",
+    inputSchema: {},
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async () => {
+    if (!currentToken) {
+      return { content: [{ type: "text" as const, text: "not-authenticated" }], structuredContent: { isAuthenticated: false } };
+    }
+    const exp = jwtExpiresAt(currentToken);
+    if (exp !== null && Date.now() >= exp - 60_000) {
+      return { content: [{ type: "text" as const, text: "token-expired" }], structuredContent: { isAuthenticated: false } };
+    }
+    return {
+      content: [{ type: "text" as const, text: "authenticated" }],
+      structuredContent: { isAuthenticated: true, expiresAt: exp ?? null },
+    };
+  }
+);
+
+server.registerTool(
+  "get_auth_config",
+  {
+    description: "Internal: returns pre-configured auth values to pre-populate the login form. Called by the App panel on login screen load.",
+    inputSchema: {},
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async () => {
+    return {
+      content: [{ type: "text" as const, text: "ok" }],
+      structuredContent: {
+        tenant:      DEFAULT_AUTH_TENANT || null,
+        hasUsername: !!DEFAULT_USERNAME,
+        hasPassword: !!DEFAULT_PASSWORD,
+      },
+    };
+  }
+);
+
+server.registerTool(
+  "panel_login",
+  {
+    description: "Internal: authenticates with Seismic using tenant, username, and password. Called by the App panel login form.",
+    inputSchema: {
+      tenant:   z.string(),
+      username: z.string(),
+      password: z.string(),
+    },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async (args) => {
+    const { tenant, username, password } = args as { tenant: string; username: string; password: string };
+    const result = await handleLogin({ tenant, username, password });
+    if ("error" in result) {
+      return {
+        content: [{ type: "text" as const, text: result.error }],
+        structuredContent: { ok: false, error: result.error },
+        isError: true,
+      };
+    }
+    return {
+      content: [{ type: "text" as const, text: result.message }],
+      structuredContent: { ok: true },
+    };
+  }
+);
+
+server.registerTool(
   "get_form_schema",
   {
     description: "Internal: returns the normalised form schema for the given token. Called by the App panel shell.",
@@ -1011,7 +1205,8 @@ server.registerTool(
       // Process 2 (App panel) — read from temp file written by Process 1
       const schemaPath = path.join(os.tmpdir(), `mcp-livedoc-schema-${token}.json`);
       if (fs.existsSync(schemaPath)) {
-        schema = JSON.parse(fs.readFileSync(schemaPath, "utf-8"));
+        schema = JSON.parse(fs.readFileSync(schemaPath, "utf-8")) as Record<string, unknown>;
+
         pendingFormSchemas.set(token, schema!);
       }
     }
@@ -1037,8 +1232,13 @@ server.registerTool(
     if (!fs.existsSync(latestPath)) {
       return { content: [{ type: "text" as const, text: "no-token" }], structuredContent: { formToken: null, isNew: false } };
     }
-    const { formToken } = JSON.parse(fs.readFileSync(latestPath, "utf-8")) as { formToken: string };
-    const isNew = !!formToken && formToken !== currentToken;
+    const { formToken, writtenAt } = JSON.parse(fs.readFileSync(latestPath, "utf-8")) as { formToken: string; writtenAt?: number };
+    // A token is "new" if it differs from what the panel already has AND was written
+    // within the last 5 minutes — guards against stale schema files from previous sessions
+    // without a timing race against when the panel mounted.
+    const FRESH_WINDOW_MS = 5 * 60 * 1000;
+    const isFresh = writtenAt === undefined || (Date.now() - writtenAt) < FRESH_WINDOW_MS;
+    const isNew = !!formToken && formToken !== currentToken && isFresh;
     return {
       content: [{ type: "text" as const, text: isNew ? `new-token:${formToken}` : "same" }],
       structuredContent: { formToken, isNew },
@@ -1122,6 +1322,7 @@ server.registerTool(
     const outputStatuses = outputs.map(o => statusName(o.status ?? o.Status));
     const allDone = outputs.length > 0 && outputStatuses.every(s => s === "Completed" || s === "Failed");
     dbg(`id=${generatedLivedocId} topStatus=${topStatus} outputs=${JSON.stringify(outputStatuses)}`);
+    dbg(`rawOutputs=${JSON.stringify(outputs)}`);
 
     // Consider done when ALL outputs have individually completed (top-level status can lag)
     const status = allDone
@@ -1134,6 +1335,7 @@ server.registerTool(
       await Promise.all(outputs.map(async (o) => {
         const outputId = String(o.id ?? o.Id ?? "");
         const format  = String(o.format ?? o.Format ?? "pptx").toLowerCase();
+        if (format === "thumbnail") return;  // thumbnail outputs don't have downloadable content
         const rawName = String(o.fileName ?? o.FileName ?? `output`);
         const fileName = path.extname(rawName) ? rawName : `${rawName}.${format}`;
         if (!outputId) return;
@@ -1233,10 +1435,22 @@ server.registerTool(
         if (res.status !== 200) return { versionId, thumbnailUrl: "" };
         const body = res.body as Record<string, unknown>;
         // imageUrl = top-level content thumbnail; contentThumbnailImageUrls[0] = first slide
-        const thumbnailUrl = String(
+        const rawUrl = String(
           (body.contentThumbnailImageUrls as string[] | undefined)?.[0] ?? body.imageUrl ?? ""
         );
-        return { versionId, thumbnailUrl };
+        if (!rawUrl) return { versionId, thumbnailUrl: "" };
+        // Fetch and inline as base64 — the App panel iframe cannot load signed CDN URLs cross-origin.
+        // 5s timeout so a single slow image cannot stall the whole batch.
+        try {
+          const imgRes = await fetch(rawUrl, {
+            headers: authHeaders() as Record<string, string>,
+            signal: AbortSignal.timeout(5000),
+          });
+          if (!imgRes.ok) return { versionId, thumbnailUrl: rawUrl };
+          const buf = Buffer.from(await imgRes.arrayBuffer());
+          const mime = imgRes.headers.get("content-type") ?? "image/jpeg";
+          return { versionId, thumbnailUrl: `data:${mime};base64,${buf.toString("base64")}` };
+        } catch { return { versionId, thumbnailUrl: rawUrl }; }
       })
     );
     const thumbnailMap: Record<string, string> = {};
@@ -1413,15 +1627,14 @@ server.registerTool(
   "login",
   {
     description:
-      "Obtain a Seismic bearer token using username and password (OAuth 2.0 Resource Owner Password Credentials). Automatically sets the token for all subsequent tool calls.",
+      "Sign in to Seismic. Authentication is handled via the LiveDoc panel UI — do NOT ask the user for credentials in chat. " +
+      "If the user needs to sign in, tell them to open the LiveDoc panel where a sign-in form will appear.",
     inputSchema: {
-      username: z.string().optional().describe(`Seismic username. Defaults to AUTH_USERNAME env var${DEFAULT_USERNAME ? " (pre-configured)" : ""}.`),
-      password: z.string().optional().describe(`Seismic password. Defaults to AUTH_PASSWORD env var.`),
-      tenant: z.string().optional().describe(`Tenant slug, e.g. "qa01eastasia01". Defaults to AUTH_TENANT env var (${DEFAULT_AUTH_TENANT || "not set"}).`),
-      authServiceUri: z.string().optional().describe("Auth service base URL. Defaults to AUTH_SERVICE_URI env var."),
-      clientId: z.string().optional().describe("OAuth client ID."),
-      clientSecret: z.string().optional().describe("OAuth client secret."),
+      tenant:   z.string().optional().describe(`Tenant slug, e.g. "qa01eastasia01". Defaults to AUTH_TENANT env var.`),
+      username: z.string().optional().describe("Seismic username. Defaults to AUTH_USERNAME env var."),
+      password: z.string().optional().describe("Seismic password. Defaults to AUTH_PASSWORD env var."),
     },
+    _meta: { ui: { visibility: ["app"] } },
   },
   async (args) => {
     const result = await handleLogin(args as Parameters<typeof handleLogin>[0]);
@@ -1432,10 +1645,11 @@ server.registerTool(
 server.registerTool(
   "set_token",
   {
-    description: "Update the Seismic API bearer token used by all other tools. Call this whenever a tool returns HTTP 401 before retrying.",
+    description: "Internal: manually override the bearer token. Use the LiveDoc panel to sign in instead.",
     inputSchema: {
       token: z.string().describe("The new bearer token (without the 'Bearer ' prefix)."),
     },
+    _meta: { ui: { visibility: ["app"] } },
   },
   async (args) => {
     currentToken = (args as { token: string }).token;
@@ -1630,10 +1844,18 @@ process.on("unhandledRejection", (reason) => {
   process.exit(1);
 });
 
+// Prefer the saved token over the env-var token if the env-var token is expired.
+// (SEISMIC_API_TOKEN in claude_desktop_config.json is often an old expired value.)
+const envTokenExp = currentToken ? jwtExpiresAt(currentToken) : null;
+if (!currentToken || (envTokenExp !== null && Date.now() >= envTokenExp - 60_000)) {
+  const saved = loadSavedToken();
+  if (saved) currentToken = saved;
+}
 // Auto-login on startup when credentials are available via env vars
 if (!currentToken && DEFAULT_USERNAME && DEFAULT_PASSWORD) {
   await autoLogin();
 }
+dbg(`startup: currentToken ${currentToken ? `present (expires ${(() => { const e = jwtExpiresAt(currentToken); return e ? new Date(e).toISOString() : "unknown"; })()})` : "absent"}`);
 
 const debugLog = path.join(os.tmpdir(), "mcp-livedoc-debug.log");
 server.server.oninitialized = () => {

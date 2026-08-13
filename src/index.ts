@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerAppTool, registerAppResource, RESOURCE_MIME_TYPE, getUiCapability } from "@modelcontextprotocol/ext-apps/server";
@@ -7,7 +7,7 @@ import { randomUUID } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { fileURLToPath } from "url";
 
 
@@ -48,37 +48,41 @@ const DEFAULT_AUTH_TENANT = process.env.AUTH_TENANT      ?? "";
 const DEFAULT_USERNAME    = process.env.AUTH_USERNAME    ?? "";
 const DEFAULT_PASSWORD    = process.env.AUTH_PASSWORD    ?? "";
 
-// Public DocCenter web client — works across all tenants, no secret required.
+// Public DocCenter web client â€” works across all tenants, no secret required.
 const BROWSER_CLIENT_ID = "0188a34d-cdbd-4208-8ebc-d0567984915e";
 const BROWSER_SCOPES    = "openid id library download engagement_read engagement_write upload " +
   "feature_read collection_read contentdiscovery doccenter_backend_read livedoc " +
   "ums_bff_read das_data_rw email profile entitlement_read aiml_llm";
 
-const pendingFormSchemas  = new Map<string, unknown>(); // token → normalised form schema for get_form_schema
-const pendingGenerations  = new Map<string, string>();  // generatedLivedocId → formToken (Process 2 only)
+const pendingFormSchemas  = new Map<string, unknown>(); // token â†’ normalised form schema for get_form_schema
+const pendingGenerations  = new Map<string, string>();  // generatedLivedocId â†’ formToken (Process 2 only)
 
 let currentToken = process.env.SEISMIC_API_TOKEN ?? "";
-// True once a token was explicitly provided via set_token — disables the silent
+// True once a token was explicitly provided via set_token â€” disables the silent
 // 401-triggered autoLogin() so it can never clobber a hand-picked token with a
 // narrower-scoped one obtained from the default credential-flow login.
 let tokenIsManual = false;
-// Credentials entered via the panel login form — cached in memory so the 401
+// Credentials entered via the panel login form â€” cached in memory so the 401
 // auto-refresh path can obtain a fresh token without env vars being set.
 let cachedTenant   = DEFAULT_AUTH_TENANT;
 let cachedUsername = DEFAULT_USERNAME;
 let cachedPassword = DEFAULT_PASSWORD;
 
-// ── Token persistence ───────────────────────────────────────────────────────
+// â”€â”€ Token persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Panel-login tokens are stored here so they survive MCP server restarts.
-const TOKEN_FILE = path.join(os.tmpdir(), "mcp-livedoc-token.json");
-const DEBUG_LOG  = path.join(os.tmpdir(), "mcp-livedoc-debug.log");
+const TOKEN_FILE  = path.join(os.tmpdir(), "mcp-livedoc-token.json");
+const DEBUG_LOG   = path.join(os.tmpdir(), "mcp-livedoc-debug.log");
+const DEBUG_ENABLED = !!process.env.MCP_LIVEDOC_DEBUG;
 
 function dbg(msg: string): void {
+  if (!DEBUG_ENABLED) return;
   try { fs.appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
 }
 
 function saveToken(token: string): void {
-  try { fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token }), "utf-8"); } catch (e) { dbg(`saveToken error: ${e}`); }
+  try {
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token }), { encoding: "utf-8", mode: 0o600 });
+  } catch (e) { dbg(`saveToken error: ${e}`); }
 }
 
 function loadSavedToken(): string {
@@ -118,7 +122,7 @@ async function browserLogin(tenant: string, username: string, password: string, 
   });
 
   dbg(`browserLogin: step1 tenant=${tenant} authBase=${authBase}`);
-  // Step 1: GET /connect/authorize with redirect:manual — the session cookie is on this first
+  // Step 1: GET /connect/authorize with redirect:manual â€” the session cookie is on this first
   // 302 response itself. We do NOT follow the redirect (it goes to the tenant login page which
   // may be unreachable). The cookie from this response is all we need for step 2.
   const step1 = await fetch(`${authBase}/connect/authorize?${params}`, {
@@ -137,10 +141,10 @@ async function browserLogin(tenant: string, username: string, password: string, 
   }).catch(e => { throw new Error(`Step 2 (login POST) fetch error: ${e}`); });
   const loginData = await loginRes.json() as { isSuccess: boolean };
   dbg(`browserLogin: step2 status=${loginRes.status} isSuccess=${loginData.isSuccess}`);
-  if (!loginData.isSuccess) throw new Error("Seismic login failed — check username/password");
+  if (!loginData.isSuccess) throw new Error("Seismic login failed â€” check username/password");
   const cookies2 = [cookies1, cookieStr(loginRes.headers)].filter(Boolean).join("; ");
 
-  // Step 3: callback — token is in the HTML form response
+  // Step 3: callback â€” token is in the HTML form response
   const cbRes = await fetch(`${authBase}/connect/authorize/callback?${params}`, {
     redirect: "manual",
     headers: { "User-Agent": "Mozilla/5.0", Cookie: cookies2, Accept: "text/html" },
@@ -166,7 +170,7 @@ async function autoLogin(): Promise<boolean> {
     dbg(`autoLogin: success`);
     return true;
   } catch (e) {
-    dbg(`autoLogin: failed — ${e}`);
+    dbg(`autoLogin: failed â€” ${e}`);
     return false;
   }
 }
@@ -188,7 +192,7 @@ async function apiFetch(
     ...options,
     headers: { ...authHeaders(), ...(options.headers as Record<string, string> ?? {}) },
   });
-  // Auto-refresh token on 401/403 — but never when the token was explicitly set via set_token.
+  // Auto-refresh token on 401/403 â€” but never when the token was explicitly set via set_token.
   // 403 "Request not allowed" from Seismic typically means an expired or wrong-scope token.
   // First: try loading a token saved by the panel process (cross-process panel login).
   // Then: try auto-login with cached credentials (env vars or from a previous panel login).
@@ -208,7 +212,7 @@ async function apiFetch(
   if (res.status === 401 || res.status === 403) {
     return {
       status: res.status,
-      body: `Authentication failed (HTTP ${res.status} — token expired or missing). The user must sign in via the LiveDoc panel before this action can proceed. Do not call open_form_ui. Do not ask the user for credentials.`,
+      body: `Authentication failed (HTTP ${res.status} â€” token expired or missing). The user must sign in via the LiveDoc panel before this action can proceed. Do not call open_form_ui. Do not ask the user for credentials.`,
     };
   }
   const text = await res.text();
@@ -237,11 +241,11 @@ function isComplex(resp: Record<string, unknown>): boolean {
   );
 }
 
-// ── Tool definitions ────────────────────────────────────────────────────────
+// â”€â”€ Tool definitions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const FORM_RESOURCE_URI = "ui://livedoc/form";
 
-// ── Tool handlers ───────────────────────────────────────────────────────────
+// â”€â”€ Tool handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 async function handleSearchTemplates(args: {
   searchText?: string;
@@ -266,7 +270,7 @@ async function handleSearchTemplates(args: {
     if (isUserClaimError) {
       return {
         error: "search_requires_user_token",
-        message: "Template search requires a user-context token. The current token is a service account token without user identity claims. To enable search: set SEISMIC_API_TOKEN in claude_desktop_config.json to a user token (obtain one from the Seismic dev portal or browser DevTools). If you already know your template's teamSiteId and libraryContentVersionId, call get_livedoc_inputs directly — authentication for generation is not affected.",
+        message: "Template search requires a user-context token. The current token is a service account token without user identity claims. To enable search: set SEISMIC_API_TOKEN in claude_desktop_config.json to a user token (obtain one from the Seismic dev portal or browser DevTools). If you already know your template's teamSiteId and libraryContentVersionId, call get_livedoc_inputs directly â€” authentication for generation is not affected.",
       };
     }
     return { error: `Search failed (HTTP ${result.status})`, detail: result.body };
@@ -353,10 +357,10 @@ async function handleSearchContent(args: {
 }
 
 // "Group"/"Section" are the only manualSelectContentItem types that are already fully valid
-// as returned — every other contentType needs real content resolved via search before submission.
+// as returned â€” every other contentType needs real content resolved via search before submission.
 // This is a denylist rather than an allowlist because the GET side's vocabulary doesn't match
 // the submission-side ManualSelectContentType enum 1:1 (e.g. GET can return "ExternalSlides",
-// which isn't even a valid value to submit — it must be resolved then re-mapped to "LiveSlide"
+// which isn't even a valid value to submit â€” it must be resolved then re-mapped to "LiveSlide"
 // or "ResourcePDF" depending on the chosen candidate's format).
 function needsContentResolution(contentType: string): boolean {
   return contentType !== "" && contentType !== "Group" && contentType !== "Section";
@@ -373,7 +377,7 @@ function boolField(item: Record<string, unknown>, ...keys: string[]): boolean {
 
 // Resolves real content candidates for one manualSelectContentItem. Prefers the item's own
 // filter/format flags (the template author's actual search criteria, e.g. Filter: [{propertyName:
-// "ContentName", operator: "CT", value: "sp3"}]) over a generic name-based guess — those flags
+// "ContentName", operator: "CT", value: "sp3"}]) over a generic name-based guess â€” those flags
 // are what get_livedoc_inputs actually returns on ExternalSlideContent items.
 const CANDIDATE_PAGE_SIZE = 10;
 
@@ -407,7 +411,7 @@ async function resolveManualSelectCandidates(item: Record<string, unknown>): Pro
     orderBy: [{ attr: "modifiedDate", direction: "DESC" }],
   };
   if (filter.length > 0) {
-    // The item's own filter is the template author's actual search criteria — combining it
+    // The item's own filter is the template author's actual search criteria â€” combining it
     // with a searchText:name guess (name is just a display label, e.g. "sp3") over-constrains
     // the query and silently returns zero results, so filter and searchText are mutually exclusive here.
     body.filter = filter;
@@ -461,7 +465,7 @@ async function handleGetInputs(args: {
   const hasImageUpload = !!((imageUpload as Record<string, unknown> | undefined)?.imageUploadContentItems as unknown[] | undefined)?.length;
 
   // Resolve external-content slots server-side instead of relying on the calling model to
-  // remember a separate search_livedoc_content step — that step was repeatedly skipped in
+  // remember a separate search_livedoc_content step â€” that step was repeatedly skipped in
   // practice, leaving the artifact with no real candidates to pick from.
   const msItems = (manualSelect ? gf(manualSelect, "manualSelectContentItems") : undefined) as Array<Record<string, unknown>> | undefined ?? [];
   await Promise.all(
@@ -627,8 +631,8 @@ async function handleSubmitGeneration(args: {
     );
     if (unresolved.length > 0) {
       return {
-        error: "WRONG TOOL — do not call submit_livedoc_generation directly when manualSelectContentInput has unresolved items.",
-        detail: `Item(s) [${unresolved.map((i) => `"${i.name ?? i.id}"`).join(", ")}] are missing versionId. You must NOT resolve versionId yourself via search_livedoc_content or any other tool. The correct flow is: (1) get_livedoc_inputs opens the form in the App panel, (2) the USER fills it out and clicks Submit — the payload is copied to their clipboard, (3) the user pastes the payload into the chat, (4) THEN call this tool with that exact pasted JSON.`,
+        error: "WRONG TOOL â€” do not call submit_livedoc_generation directly when manualSelectContentInput has unresolved items.",
+        detail: `Item(s) [${unresolved.map((i) => `"${i.name ?? i.id}"`).join(", ")}] are missing versionId. You must NOT resolve versionId yourself via search_livedoc_content or any other tool. The correct flow is: (1) get_livedoc_inputs opens the form in the App panel, (2) the USER fills it out and clicks Submit â€” the payload is copied to their clipboard, (3) the user pastes the payload into the chat, (4) THEN call this tool with that exact pasted JSON.`,
       };
     }
   }
@@ -658,7 +662,7 @@ async function handleSubmitGeneration(args: {
     ? `?liveFormSellerTemplateId=${encodeURIComponent(args.liveFormSellerTemplateId)}`
     : "";
 
-  // Debug dump — readable at %TEMP%\mcp-livedoc-debug-submit.json after each Submit
+  // Debug dump â€” readable at %TEMP%\mcp-livedoc-debug-submit.json after each Submit
   try { fs.writeFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug-submit.json"), JSON.stringify(reqBody, null, 2)); } catch { /* ignore */ }
 
   const result = await apiFetch(
@@ -762,14 +766,17 @@ function getDownloadsDir(): string {
 }
 
 // Opens a local file with the OS-registered default application (e.g. double-click behavior).
+// Uses execFile (no shell) so filePath cannot be used for command injection.
 function openWithDefaultApp(filePath: string) {
   const platform = process.platform;
-  const quoted = `"${filePath}"`;
-  const cmd =
-    platform === "win32" ? `start "" ${quoted}` :
-    platform === "darwin" ? `open ${quoted}` :
-    `xdg-open ${quoted}`;
-  exec(cmd, () => { /* best-effort; failures are non-fatal */ });
+  if (platform === "win32") {
+    // explorer.exe opens a file with its registered default application, no shell involved.
+    execFile("explorer.exe", [filePath], () => { /* best-effort */ });
+  } else if (platform === "darwin") {
+    execFile("open", [filePath], () => { /* best-effort */ });
+  } else {
+    execFile("xdg-open", [filePath], () => { /* best-effort */ });
+  }
 }
 
 function uniqueFilePath(dir: string, fileName: string): string {
@@ -794,7 +801,7 @@ async function handleDownloadGenerationOutput(args: {
     return dl;
   }
   const body = dl as Record<string, unknown>;
-  // DownloadLocationResp only ever contains `downloadUrl` — it never carries a fileName.
+  // DownloadLocationResp only ever contains `downloadUrl` â€” it never carries a fileName.
   // The real fileName (with extension) lives on get_generation_status's outputs[], so look it up there.
   const url = String(body.url ?? body.downloadUrl ?? body.Url ?? body.DownloadUrl ?? "");
   if (!url) {
@@ -853,7 +860,7 @@ async function handleOpenFormUi(args: { teamSiteId: string; libraryContentVersio
       body: JSON.stringify({ token: currentToken }),
     });
   } catch {
-    // Non-fatal — form server may not be running yet; it will fall back to its own env var.
+    // Non-fatal â€” form server may not be running yet; it will fall back to its own env var.
   }
 
   const token = generateToken();
@@ -884,7 +891,7 @@ async function handleOpenFormUi(args: { teamSiteId: string; libraryContentVersio
 async function handleGetFormResult(args: { token: string }) {
   const res = await fetch(`${FORM_API_BASE}/api/result/${args.token}`);
   if (res.status === 404) {
-    return { error: "Result not ready yet — the form may still be open or generation is in progress. Try again in a moment." };
+    return { error: "Result not ready yet â€” the form may still be open or generation is in progress. Try again in a moment." };
   }
   if (!res.ok) {
     return { error: `Failed to retrieve result (HTTP ${res.status})` };
@@ -920,26 +927,26 @@ async function handleLogin(args: {
     cachedUsername = username;
     cachedPassword = password;
     const exp = jwtExpiresAt(currentToken);
-    dbg(`handleLogin: success — token set, expires=${exp ? new Date(exp).toISOString() : "unknown"}`);
+    dbg(`handleLogin: success â€” token set, expires=${exp ? new Date(exp).toISOString() : "unknown"}`);
     return { ok: true, message: "Token obtained successfully. All tools are now authenticated." };
   } catch (e) {
-    dbg(`handleLogin: failed — ${e}`);
+    dbg(`handleLogin: failed â€” ${e}`);
     return { error: String(e), detail: null };
   }
 }
 
-// ── Server wiring ───────────────────────────────────────────────────────────
+// â”€â”€ Server wiring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 const server = new McpServer({ name: "seismic-livedoc", version: "1.0.0" });
 
-// MCP App UI resource — served when Claude Desktop opens the App panel.
+// MCP App UI resource â€” served when Claude Desktop opens the App panel.
 // frameDomains CSP is on the registration config (resources/list) so Claude Desktop
-// applies it at connection time. The shell uses callServerTool only — no connectDomains needed.
+// applies it at connection time. The shell uses callServerTool only â€” no connectDomains needed.
 registerAppResource(
   server,
   "LiveDoc Form",
   FORM_RESOURCE_URI,
-  { description: "LiveDoc input form — React shell built by Vite." } as Parameters<typeof registerAppResource>[3],
+  { description: "LiveDoc input form â€” React shell built by Vite." } as Parameters<typeof registerAppResource>[3],
   () => {
     const shellPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "views", "form-shell.html");
     const text = fs.readFileSync(shellPath, "utf-8");
@@ -962,14 +969,14 @@ registerAppResource(
   }
 );
 
-// ── Tool registrations ──────────────────────────────────────────────────────
+// â”€â”€ Tool registrations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 server.registerTool(
   "search_livedoc_templates",
   {
     description:
       "Search for LiveDoc (Document Generator) templates in Seismic by name or keyword. Returns contentVersionId and teamSiteId needed for other tools. " +
-      "ALWAYS call this FIRST whenever the user names or describes a template — do NOT ask for teamSiteId/libraryContentVersionId directly. " +
+      "ALWAYS call this FIRST whenever the user names or describes a template â€” do NOT ask for teamSiteId/libraryContentVersionId directly. " +
       "Only ask the user to disambiguate if this search returns zero or multiple plausible matches.",
     inputSchema: {
       searchText: z.string().optional().describe("Text to search across template title, description, and body."),
@@ -1000,17 +1007,17 @@ server.registerTool(
   }
 );
 
-// open_livedoc_panel — opens the App panel so the user can sign in or check status
+// open_livedoc_panel â€” opens the App panel so the user can sign in or check status
 registerAppTool(
   server,
   "open_livedoc_panel",
   {
     description:
       "Open the LiveDoc App panel for sign-in. ONLY call this when a tool explicitly returns an HTTP 401 error, or when the user explicitly asks to log in. " +
-      "Do NOT call this proactively before attempting any tool — always try the actual tool first and react to failures. " +
+      "Do NOT call this proactively before attempting any tool â€” always try the actual tool first and react to failures. " +
       "IMPORTANT: After calling this tool, you MUST stop and tell the user to sign in via the panel, then WAIT. " +
       "Do NOT call any other tools until the user sends a follow-up message confirming they have signed in. " +
-      "Do NOT ask the user for credentials — the panel has its own sign-in form.",
+      "Do NOT ask the user for credentials â€” the panel has its own sign-in form.",
     inputSchema: {},
     _meta: { ui: { resourceUri: FORM_RESOURCE_URI } },
   },
@@ -1019,7 +1026,7 @@ registerAppTool(
     const isAuthenticated = !!currentToken && (exp === null || Date.now() < exp - 60_000);
     return {
       content: [{ type: "text" as const, text: isAuthenticated
-        ? "Panel opened. The user is already signed in — proceed with their request."
+        ? "Panel opened. The user is already signed in â€” proceed with their request."
         : "Panel opened showing the sign-in form. STOP HERE. Tell the user to fill in their credentials in the panel and click Sign in. Do not call any other tool until the user confirms they have signed in.",
       }],
       structuredContent: { action: isAuthenticated ? "ready" : "show_login" },
@@ -1038,20 +1045,20 @@ server.registerTool(
     const exp = currentToken ? jwtExpiresAt(currentToken) : null;
     const isAuthenticated = !!currentToken && (exp === null || Date.now() < exp - 60_000);
     return {
-      content: [{ type: "text" as const, text: isAuthenticated ? "Authenticated — token is valid." : "Not authenticated — token is missing or expired. Call open_livedoc_panel and wait for the user to sign in." }],
+      content: [{ type: "text" as const, text: isAuthenticated ? "Authenticated â€” token is valid." : "Not authenticated â€” token is missing or expired. Call open_livedoc_panel and wait for the user to sign in." }],
       structuredContent: { isAuthenticated, expiresAt: exp ?? null },
     };
   }
 );
 
-// get_livedoc_inputs — opens the MCP App panel with the form
+// get_livedoc_inputs â€” opens the MCP App panel with the form
 registerAppTool(
   server,
   "get_livedoc_inputs",
   {
     description:
       "Retrieve the full input schema for a LiveDoc template and open the interactive input form in the App panel. " +
-      "The form appears in the App panel automatically. The user fills it out and clicks Submit — " +
+      "The form appears in the App panel automatically. The user fills it out and clicks Submit â€” " +
       "generation starts directly from the panel. " +
       "Once the user tells you generation is done (or the panel shows 'Generation complete'), " +
       "call get_panel_result with the formToken to get the generatedLivedocId and download URLs, " +
@@ -1076,7 +1083,7 @@ registerAppTool(
 
     // External content candidate thumbnails are fetched lazily by the panel via
     // get_candidate_thumbnails (which inlines them server-side). Do NOT pre-fetch
-    // them here — there can be 30+ candidates and the per-image timeout would stall
+    // them here â€” there can be 30+ candidates and the per-image timeout would stall
     // get_livedoc_inputs unacceptably.
 
     pendingFormSchemas.set(formToken, schema);
@@ -1098,7 +1105,7 @@ registerAppTool(
       content: [{
         type: "text" as const,
         text: `Form opened in the App panel (formToken="${formToken}"). ` +
-          `The user fills it out and clicks Submit in the panel — generation runs automatically. ` +
+          `The user fills it out and clicks Submit in the panel â€” generation runs automatically. ` +
           `DO NOT call open_form_ui. DO NOT call submit_form. DO NOT call get_form_result. ` +
           `Just tell the user to fill the form. When they say it is done, call get_panel_result with formToken="${formToken}".`,
       }],
@@ -1202,7 +1209,7 @@ server.registerTool(
     const { token } = args as { token: string };
     let schema = pendingFormSchemas.get(token);
     if (!schema) {
-      // Process 2 (App panel) — read from temp file written by Process 1
+      // Process 2 (App panel) â€” read from temp file written by Process 1
       const schemaPath = path.join(os.tmpdir(), `mcp-livedoc-schema-${token}.json`);
       if (fs.existsSync(schemaPath)) {
         schema = JSON.parse(fs.readFileSync(schemaPath, "utf-8")) as Record<string, unknown>;
@@ -1234,7 +1241,7 @@ server.registerTool(
     }
     const { formToken, writtenAt } = JSON.parse(fs.readFileSync(latestPath, "utf-8")) as { formToken: string; writtenAt?: number };
     // A token is "new" if it differs from what the panel already has AND was written
-    // within the last 5 minutes — guards against stale schema files from previous sessions
+    // within the last 5 minutes â€” guards against stale schema files from previous sessions
     // without a timing race against when the panel mounted.
     const FRESH_WINDOW_MS = 5 * 60 * 1000;
     const isFresh = writtenAt === undefined || (Date.now() - writtenAt) < FRESH_WINDOW_MS;
@@ -1414,6 +1421,35 @@ server.registerTool(
 );
 
 server.registerTool(
+  "get_preview_images",
+  {
+    description: "Internal: fetches preview image URLs for a completed generation output. Called by the App panel after generation completes.",
+    inputSchema: {
+      generatedLivedocId: z.string(),
+      outputId: z.string().describe("Output ID or format alias like 'pptx' or 'pdf'"),
+    },
+    _meta: { ui: { visibility: ["app"] } },
+  },
+  async (args) => {
+    const { generatedLivedocId, outputId } = args as { generatedLivedocId: string; outputId: string };
+    const res = await apiFetch(`/v3/generatedLivedocs/${generatedLivedocId}/outputs/${outputId}/previewImages`);
+    if (res.status !== 200) {
+      return {
+        content: [{ type: "text" as const, text: `Preview images unavailable: HTTP ${res.status}` }],
+        structuredContent: { images: [] },
+      };
+    }
+    const body = res.body as Record<string, unknown>;
+    const images = ((body.previewImages as Array<{ index: number; url: string }>) ?? [])
+      .map(img => ({ index: img.index, url: img.url }));
+    return {
+      content: [{ type: "text" as const, text: `${images.length} preview images` }],
+      structuredContent: { images },
+    };
+  }
+);
+
+server.registerTool(
   "get_candidate_thumbnails",
   {
     description: "Internal: fetches top-level thumbnail URLs for a batch of content candidates. Called by the App panel after form schema loads.",
@@ -1439,11 +1475,20 @@ server.registerTool(
           (body.contentThumbnailImageUrls as string[] | undefined)?.[0] ?? body.imageUrl ?? ""
         );
         if (!rawUrl) return { versionId, thumbnailUrl: "" };
-        // Fetch and inline as base64 — the App panel iframe cannot load signed CDN URLs cross-origin.
+        // Fetch and inline as base64 â€” the App panel iframe cannot load signed CDN URLs cross-origin.
         // 5s timeout so a single slow image cannot stall the whole batch.
+        // Only attach auth headers when the URL is on a known Seismic domain â€” never leak
+        // the bearer token to a third-party host if the API ever returns an unexpected URL.
+        let thumbnailHeaders: Record<string, string> = {};
+        try {
+          const host = new URL(rawUrl).hostname;
+          if (host.endsWith(".seismic.com") || host.endsWith(".seismic-dev.com")) {
+            thumbnailHeaders = authHeaders() as Record<string, string>;
+          }
+        } catch { /* malformed URL â€” proceed without auth */ }
         try {
           const imgRes = await fetch(rawUrl, {
-            headers: authHeaders() as Record<string, string>,
+            headers: thumbnailHeaders,
             signal: AbortSignal.timeout(5000),
           });
           if (!imgRes.ok) return { versionId, thumbnailUrl: rawUrl };
@@ -1470,11 +1515,11 @@ server.registerTool(
     description:
       "Get the result of the LiveDoc generation triggered from the App panel. " +
       "Call this after the user says generation is done. Returns generatedLivedocId, status, downloads array, and templateName. " +
-      "IMPORTANT — when status is 'Completed': " +
+      "IMPORTANT â€” when status is 'Completed': " +
       "(1) Create an HTML artifact (type='text/html') showing a generation-complete card. " +
       "The card must include: a green check icon, 'Generation complete' heading, templateName, 'Completed' badge, " +
       "a DOWNLOADS section listing each file (icon by format, fileName, format label, a download arrow link to its url), " +
-      "and a small 'Links expire …' note at the bottom. Keep the HTML concise (no external resources). " +
+      "and a small 'Links expire â€¦' note at the bottom. Keep the HTML concise (no external resources). " +
       "(2) Also call download_generation_output for each output to save the files locally. " +
       "If status is still 'Generating', tell the user to wait and offer to check again.",
     inputSchema: {
@@ -1486,7 +1531,7 @@ server.registerTool(
     const resultPath = path.join(os.tmpdir(), `mcp-livedoc-result-${formToken}.json`);
     if (!fs.existsSync(resultPath)) {
       return {
-        content: [{ type: "text" as const, text: "No result yet — generation has not started or the form has not been submitted. Check the App panel." }],
+        content: [{ type: "text" as const, text: "No result yet â€” generation has not started or the form has not been submitted. Check the App panel." }],
       };
     }
     const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as {
@@ -1530,7 +1575,7 @@ server.registerTool(
       regionalFormat: z.string().optional().describe("Regional format culture name, e.g. \"en-US\"."),
       manualSelectContentInput: z.object({
         manualSelectContentItems: z.array(z.object({
-          id: z.string().describe("Stable slot identifier — copy verbatim from get_livedoc_inputs."),
+          id: z.string().describe("Stable slot identifier â€” copy verbatim from get_livedoc_inputs."),
           name: z.string().optional(),
           contentType: z.string().describe("One of \"Group\", \"Section\", \"LiveSlide\", \"ResourcePDF\", etc."),
           versionId: z.string().optional().describe("contentVersionId from the pasted form payload. Never populate yourself."),
@@ -1539,7 +1584,7 @@ server.registerTool(
           isInclude: z.boolean(),
           orderIndex: z.number().optional(),
         })),
-      }).optional().describe("Content selection — pass ONLY what the pasted form payload contained."),
+      }).optional().describe("Content selection â€” pass ONLY what the pasted form payload contained."),
     },
   },
   async (args) => {
@@ -1578,7 +1623,7 @@ server.registerTool(
     const outputs = (st.outputs as Array<Record<string, unknown>>) ?? [];
     const allDone = st.allDone as boolean;
     const nextStep = allDone
-      ? `All done. NEXT: call download_generation_output for each completed output:\n${outputs.filter(o => o.status === "Completed").map(o => `  outputId="${o.id}" (${o.format} — ${o.fileName})`).join("\n")}`
+      ? `All done. NEXT: call download_generation_output for each completed output:\n${outputs.filter(o => o.status === "Completed").map(o => `  outputId="${o.id}" (${o.format} â€” ${o.fileName})`).join("\n")}`
       : `Still generating. NEXT: call get_generation_status again with generatedLivedocId="${st.generatedLivedocId}" in a few seconds.`;
     return {
       content: [{
@@ -1593,7 +1638,7 @@ server.registerTool(
   "open_form_ui",
   {
     description:
-      "DEPRECATED — DO NOT call this after get_livedoc_inputs. The form is now embedded in the App panel. " +
+      "DEPRECATED â€” DO NOT call this after get_livedoc_inputs. The form is now embedded in the App panel. " +
       "get_livedoc_inputs already opens the panel form automatically. Calling this tool will open a redundant browser window. " +
       "This tool is kept only as a last-resort fallback when the App panel is unavailable.",
     inputSchema: {
@@ -1627,7 +1672,7 @@ server.registerTool(
   "login",
   {
     description:
-      "Sign in to Seismic. Authentication is handled via the LiveDoc panel UI — do NOT ask the user for credentials in chat. " +
+      "Sign in to Seismic. Authentication is handled via the LiveDoc panel UI â€” do NOT ask the user for credentials in chat. " +
       "If the user needs to sign in, tell them to open the LiveDoc panel where a sign-in form will appear.",
     inputSchema: {
       tenant:   z.string().optional().describe(`Tenant slug, e.g. "qa01eastasia01". Defaults to AUTH_TENANT env var.`),
@@ -1682,7 +1727,7 @@ server.registerTool(
     return {
       content: [{
         type: "text" as const,
-        text: `✅ **${dlFile}** is ready.\n\nDownload link: [${dlFile}](${dlUrl})\n\n(Reproduce the markdown link above verbatim in your reply so the user can click it.)`,
+        text: `âœ… **${dlFile}** is ready.\n\nDownload link: [${dlFile}](${dlUrl})\n\n(Reproduce the markdown link above verbatim in your reply so the user can click it.)`,
       }],
     };
   }
@@ -1734,7 +1779,7 @@ server.registerTool(
   }
 );
 
-// ── PPTX Auto-Tagging tools (PoC) ────────────────────────────────────────────
+// â”€â”€ PPTX Auto-Tagging tools (PoC) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 server.registerTool(
   "pptx_extract_shapes",
@@ -1809,7 +1854,7 @@ server.registerTool(
       content: [{
         type: "text" as const,
         text: JSON.stringify({ markedAt: result.markedAt, bindingCount: result.bindings.length, bindings: result.bindings }, null, 2) +
-          "\n\n(markedPptxBase64 available in full result — use pptx_mark_shapes result.pptxBase64 to save the file)",
+          "\n\n(markedPptxBase64 available in full result â€” use pptx_mark_shapes result.pptxBase64 to save the file)",
       }],
     };
   }

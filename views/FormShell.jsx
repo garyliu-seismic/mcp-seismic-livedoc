@@ -274,7 +274,8 @@ function FormApp() {
   const [vlTables, setVlTables] = useState({});   // { "vl|tableName": [rows] }
   const [grpInc,   setGrpInc]   = useState({});   // { groupId: bool }
   const [extSel,   setExtSel]   = useState({});   // { slotId: Set<versionId> }
-  const [previewImg, setPreviewImg] = useState(null); // { url, title } for lightbox
+  const [previewImg, setPreviewImg] = useState(null); // { images: [{url,title}], idx } for lightbox
+  const [previews,   setPreviews]   = useState([]);    // [{ format, images: [{index,url}] }]
   const [thumbs,         setThumbs]         = useState({});   // { versionId: thumbnailUrl }
   const [manualOutputFmts, setManualOutputFmts] = useState(["PPTX"]); // fallback when API has no output defs
   const [fmtIdx,   setFmtIdx]   = useState(0);    // selected formOption index
@@ -458,10 +459,10 @@ function FormApp() {
       (vl.tables ?? []).forEach(t => {
         variableInputs.push({ name: t.name, value: tableValue(vlTables[`${vl.name}|${t.name}`] ?? [], t.columns) });
       });
-      // Skip VLs where all inputs are empty/zero
+      // Skip VLs where all inputs are empty/zero/false (default unchecked booleans)
       const hasData = variableInputs.some(inp => {
         const v = inp.value;
-        if (v === null || v === undefined || v === "" || v === 0) return false;
+        if (v === null || v === undefined || v === "" || v === 0 || v === false) return false;
         if (typeof v === "object" && Array.isArray(v.rows)) return v.rows.length > 0;
         return true;
       });
@@ -500,6 +501,31 @@ function FormApp() {
     return payload;
   }
 
+  // ── preview images ───────────────────────────────────────────────────────────
+
+  async function fetchPreviews(app, generatedLivedocId, downloads) {
+    const previewable = (downloads ?? []).filter(d => ["pptx", "pdf"].includes((d.format ?? "").toLowerCase()));
+    if (!previewable.length) return;
+    const results = await Promise.all(previewable.map(async d => {
+      try {
+        const res = await app.callServerTool({
+          name: "get_preview_images",
+          arguments: { generatedLivedocId, outputId: d.format.toLowerCase() },
+        });
+        const images = (res?.structuredContent?.images ?? [])
+          .filter(img => typeof img.url === "string" && img.url.startsWith("https://"));
+        return { format: d.format.toUpperCase(), images };
+      } catch {
+        return { format: d.format.toUpperCase(), images: [] };
+      }
+    }));
+    const nonempty = results.filter(r => r.images.length > 0);
+    if (nonempty.length > 0) {
+      setPreviews(nonempty);
+      appRef.current?.sendSizeChanged({ width: 520, height: 820 });
+    }
+  }
+
   // ── submit & poll ────────────────────────────────────────────────────────────
 
   async function handleSubmit() {
@@ -520,9 +546,12 @@ function FormApp() {
       // Poll until done
       setPhase("polling");
       const pollResult = await pollUntilDone(app, generatedLivedocId);
-      setResult({ generatedLivedocId, downloadUrls: pollResult.downloadUrls ?? [], downloads: pollResult.downloads ?? [] });
+      const dls = pollResult.downloads ?? [];
+      setResult({ generatedLivedocId, downloadUrls: pollResult.downloadUrls ?? [], downloads: dls });
+      setPreviews([]);
       setPhase("done");
       app.sendSizeChanged({ width: 520, height: 500 });
+      fetchPreviews(app, generatedLivedocId, dls);
     } catch (e) {
       setErrMsg(String(e));
       setPhase("error");
@@ -593,6 +622,37 @@ function FormApp() {
                 </div>
           }
         </div>
+
+        {previews.length === 0 && downloads.some(d => ["pptx","pdf"].includes((d.format??"").toLowerCase())) && (
+          <div style={{ marginTop: 12, color: "#888", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ ...S.spinner, borderColor: "#ccc", borderTopColor: "#888" }} />
+            Loading preview…
+          </div>
+        )}
+
+        {previews.map(p => {
+          const lightboxImages = p.images.map((img, n) => ({ url: img.url, title: `${p.format} — Slide ${n + 1} of ${p.images.length}` }));
+          return (
+            <div key={p.format} style={{ marginTop: 14 }}>
+              <div style={{ ...S.sl, marginBottom: 8 }}>{p.format} Preview — {p.images.length} slide{p.images.length !== 1 ? "s" : ""}</div>
+              <div style={{ display: "flex", overflowX: "auto", gap: 8, paddingBottom: 6 }}>
+                {p.images.map((img, idx) => (
+                  <div
+                    key={img.index}
+                    onClick={() => setPreviewImg({ images: lightboxImages, idx })}
+                    style={{ flexShrink: 0, width: 120, height: 80, borderRadius: 5, overflow: "hidden",
+                      cursor: "zoom-in", border: "1.5px solid #dde3ea", background: "#f5f5f5",
+                      boxShadow: "0 1px 3px rgba(0,0,0,.1)" }}
+                    title={`Slide ${img.index + 1}`}
+                  >
+                    <img src={img.url} alt={`Slide ${img.index + 1}`}
+                      style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
       </div>
     );
   }
@@ -687,9 +747,11 @@ function FormApp() {
                         style={{ width: "100%", height: 90, objectFit: "cover", display: "block" }} />
                       <div style={{ padding: "5px 7px", fontSize: 11, fontWeight: 600, color: "#333", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.name}</div>
                       {on && <div style={{ position: "absolute", top: 4, right: 4, background: "#0066cc", color: "#fff", borderRadius: "50%", width: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11 }}>✓</div>}
-                      <button onClick={e => { e.stopPropagation(); setPreviewImg({ url: g.thumbnailUrl, title: g.name }); }}
+                      <button
                         title="Preview"
-                        style={{ position: "absolute", bottom: 28, right: 4, background: "rgba(0,0,0,0.45)", border: "none", borderRadius: "50%", width: 22, height: 22, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "#fff", fontSize: 12, lineHeight: 1 }}>
+                        onClick={e => { e.stopPropagation(); setPreviewImg({ images: [{ url: g.thumbnailUrl, title: g.name }], idx: 0 }); }}
+                        style={{ position: "absolute", bottom: 28, right: 4, background: "rgba(0,0,0,0.45)", border: "none", borderRadius: "50%", width: 22, height: 22, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "#fff", fontSize: 12, lineHeight: 1 }}
+                      >
                         👁
                       </button>
                     </div>
@@ -851,20 +913,54 @@ function FormApp() {
       <button onClick={handleSubmit} style={S.sub}>▶ Submit generation</button>
 
       {/* ── Lightbox ── */}
-      {previewImg && (
-        <div onClick={() => setPreviewImg(null)}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999,
-            display: "flex", alignItems: "center", justifyContent: "center", cursor: "zoom-out" }}>
-          <div onClick={e => e.stopPropagation()}
-            style={{ position: "relative", maxWidth: "90vw", maxHeight: "90vh" }}>
-            <img src={previewImg.url} alt={previewImg.title}
-              style={{ display: "block", maxWidth: "90vw", maxHeight: "85vh", borderRadius: 6, boxShadow: "0 8px 40px rgba(0,0,0,0.5)" }} />
-            <div style={{ textAlign: "center", color: "#fff", fontSize: 13, marginTop: 8, fontWeight: 600 }}>{previewImg.title}</div>
-            <button onClick={() => setPreviewImg(null)}
-              style={{ position: "absolute", top: -12, right: -12, background: "#fff", border: "none", borderRadius: "50%", width: 26, height: 26, cursor: "pointer", fontSize: 14, fontWeight: 700, lineHeight: "26px" }}>✕</button>
+      {previewImg && (() => {
+        const cur = previewImg.images[previewImg.idx];
+        const total = previewImg.images.length;
+        const hasPrev = previewImg.idx > 0;
+        const hasNext = previewImg.idx < total - 1;
+        return (
+          <div onClick={() => setPreviewImg(null)}
+            style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.85)", zIndex: 9999,
+              display: "flex", alignItems: "center", justifyContent: "center" }}>
+            {/* Prev arrow */}
+            {total > 1 && (
+              <button
+                onClick={e => { e.stopPropagation(); setPreviewImg(p => ({ ...p, idx: Math.max(0, p.idx - 1) })); }}
+                disabled={!hasPrev}
+                style={{ position: "fixed", left: 16, top: "50%", transform: "translateY(-50%)",
+                  background: "rgba(255,255,255,0.15)", border: "none", borderRadius: "50%",
+                  width: 44, height: 44, fontSize: 26, color: "#fff", cursor: hasPrev ? "pointer" : "default",
+                  opacity: hasPrev ? 1 : 0.25, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                ‹
+              </button>
+            )}
+            <div onClick={e => e.stopPropagation()}
+              style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center",
+                maxWidth: "calc(100vw - 100px)", maxHeight: "90vh" }}>
+              <img src={cur.url} alt={cur.title}
+                style={{ display: "block", maxWidth: "calc(100vw - 100px)", maxHeight: "80vh", borderRadius: 6,
+                  boxShadow: "0 8px 40px rgba(0,0,0,0.5)", objectFit: "contain" }} />
+              <div style={{ textAlign: "center", color: "#ccc", fontSize: 12, marginTop: 8 }}>{cur.title}</div>
+              <button onClick={() => setPreviewImg(null)}
+                style={{ position: "absolute", top: -12, right: -12, background: "#fff", border: "none",
+                  borderRadius: "50%", width: 26, height: 26, cursor: "pointer", fontSize: 14,
+                  fontWeight: 700, lineHeight: "26px", zIndex: 1 }}>✕</button>
+            </div>
+            {/* Next arrow */}
+            {total > 1 && (
+              <button
+                onClick={e => { e.stopPropagation(); setPreviewImg(p => ({ ...p, idx: Math.min(p.images.length - 1, p.idx + 1) })); }}
+                disabled={!hasNext}
+                style={{ position: "fixed", right: 16, top: "50%", transform: "translateY(-50%)",
+                  background: "rgba(255,255,255,0.15)", border: "none", borderRadius: "50%",
+                  width: 44, height: 44, fontSize: 26, color: "#fff", cursor: hasNext ? "pointer" : "default",
+                  opacity: hasNext ? 1 : 0.25, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                ›
+              </button>
+            )}
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }

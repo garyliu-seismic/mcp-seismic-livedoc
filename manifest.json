@@ -1,0 +1,96 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "1.0.1",
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "name": {
+    "short": "Livedoc Variables POC",
+    "full": "Livedoc Variables POC - Ad-hoc variable insertion"
+  },
+  "description": {
+    "short": "POC: Office.js ad-hoc variable insertion",
+    "full": "POC for inserting ad-hoc variables into PowerPoint presentations using Office.js"
+  },
+  "developer": {
+    "name": "Seismic Livedoc POC",
+    "websiteUrl": "https://localhost:3000",
+    "privacyUrl": "https://localhost:3000",
+    "termsOfUseUrl": "https://localhost:3000"
+  },
+  "icons": {
+    "outline": "assets/icon-16.png",
+    "color": "assets/icon-80.png"
+  },
+  "accentColor": "#230201",
+  "localizationInfo": {
+    "defaultLanguageTag": "en-us"
+  },
+  "authorization": {
+    "permissions": {
+      "resourceSpecific": []
+    }
+  },
+  "validDomains": [
+    "localhost:3000"
+  ],
+  "extensions": [
+    {
+      "requirements": {
+        "scopes": [ "presentation" ]
+      },
+      "runtimes": [
+        {
+          "id": "TaskPaneRuntime",
+          "type": "general",
+          "code": {
+            "page": "https://localhost:3000/taskpane.html"
+          },
+          "lifetime": "short",
+          "actions": [
+            {
+              "id": "ShowVariablesPane",
+              "type": "openPage"
+            }
+          ]
+        }
+      ],
+      "ribbons": [
+        {
+          "tabs": [
+            {
+              "builtInTabId": "TabHome",
+              "groups": [
+                {
+                  "id": "LivedocGroup",
+                  "label": "Livedoc",
+                  "icons": [
+                    { "size": 16, "url": "https://localhost:3000/assets/icon-16.png" },
+                    { "size": 32, "url": "https://localhost:3000/assets/icon-32.png" },
+                    { "size": 80, "url": "https://localhost:3000/assets/icon-80.png" }
+                  ],
+                  "controls": [
+                    {
+                      "id": "ShowVariablesButton",
+                      "type": "button",
+                      "label": "Variables",
+                      "icons": [
+                        { "size": 16, "url": "https://localhost:3000/assets/icon-16.png" },
+                        { "size": 32, "url": "https://localhost:3000/assets/icon-32.png" },
+                        { "size": 80, "url": "https://localhost:3000/assets/icon-80.png" }
+                      ],
+                      "supertip": {
+                        "title": "Livedoc Variables",
+                        "description": "Open the Livedoc Variables panel to define and insert ad-hoc variables."
+                      },
+                      "actionId": "ShowVariablesPane"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

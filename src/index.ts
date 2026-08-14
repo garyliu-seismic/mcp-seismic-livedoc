@@ -7,7 +7,7 @@ import * as path from "path";
 import * as os from "os";
 import { dbg } from "./utils/debug.js";
 import { loadSavedToken } from "./auth/token-store.js";
-import { setToken, getToken } from "./auth/state.js";
+import { setToken, getToken, isTokenManual } from "./auth/state.js";
 import { autoLogin } from "./auth/auto-login.js";
 import { jwtExpiresAt } from "./auth/jwt.js";
 import { registerChatTools } from "./tools/chat-tools.js";
@@ -46,6 +46,20 @@ if (savedToken && (!envToken || savedToken !== envToken)) {
 if (!getToken() || (jwtExpiresAt(getToken()) !== null && Date.now() >= (jwtExpiresAt(getToken()) ?? 0) - 60_000)) {
   autoLogin().then(ok => { if (ok) dbg("startup: autoLogin succeeded"); }).catch(() => {});
 }
+
+// Proactively refresh the token when it is within 5 minutes of expiry.
+// Runs every 60 s; skips when token was set manually (set_token tool) to
+// avoid clobbering an explicitly-provided token.
+setInterval(() => {
+  if (isTokenManual()) return;
+  const exp = jwtExpiresAt(getToken());
+  if (exp === null) return; // non-JWT token — don't touch it
+  const msRemaining = exp - Date.now();
+  if (msRemaining > 0 && msRemaining <= 5 * 60_000) {
+    dbg(`token-refresh: expires in ${Math.round(msRemaining / 1000)}s, refreshing`);
+    autoLogin().then(ok => { if (ok) dbg("token-refresh: succeeded"); }).catch(() => {});
+  }
+}, 60_000).unref?.();
 
 const transport = new StdioServerTransport();
 server.server.oninitialized = () => {

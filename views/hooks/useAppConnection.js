@@ -51,6 +51,8 @@ export function useAppConnection({ onFormLoad, onError }) {
 
       const formToken = event?.structuredContent?.formToken;
       if (!formToken) return;
+      // Don't hijack an active form — only accept a new schema when idle.
+      if (phaseRef.current !== "connecting") return;
       tokenRef.current = formToken;
       phaseRef.current = "loading";
       setPhase("loading");

@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+﻿#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerAppTool, registerAppResource, RESOURCE_MIME_TYPE, getUiCapability } from "@modelcontextprotocol/ext-apps/server";
@@ -139,9 +139,12 @@ async function browserLogin(tenant: string, username: string, password: string, 
     headers: { "Content-Type": "application/json", "User-Agent": "Mozilla/5.0", Cookie: cookies1 },
     body: JSON.stringify({ Username: username, Password: password, RememberMe: false, ClientId: BROWSER_CLIENT_ID, ClientVersion: "", DisableSingleSignOn: false }),
   }).catch(e => { throw new Error(`Step 2 (login POST) fetch error: ${e}`); });
-  const loginData = await loginRes.json() as { isSuccess: boolean };
+  const loginText = await loginRes.text().catch(e => { throw new Error(`Step 2 (login POST) body read error: ${e}`); });
+  let loginData: { isSuccess: boolean };
+  try { loginData = JSON.parse(loginText) as { isSuccess: boolean }; }
+  catch { throw new Error(`Step 2 (login POST) non-JSON response (HTTP ${loginRes.status}): ${loginText.slice(0, 300)}`); }
   dbg(`browserLogin: step2 status=${loginRes.status} isSuccess=${loginData.isSuccess}`);
-  if (!loginData.isSuccess) throw new Error("Seismic login failed â€” check username/password");
+  if (!loginData.isSuccess) throw new Error("Seismic login failed - check username/password");
   const cookies2 = [cookies1, cookieStr(loginRes.headers)].filter(Boolean).join("; ");
 
   // Step 3: callback â€” token is in the HTML form response
@@ -958,8 +961,8 @@ registerAppResource(
         _meta: {
           ui: {
             csp: {
-              // Allow loading slide group thumbnail images from Seismic download CDN.
-              // These are signed URLs on download-*-edge.seismic-dev.com / seismic.com.
+              // Allow the iframe to load images directly from the Seismic CDN —
+              // slide group thumbnails, content candidate thumbnails, and preview images.
               resourceDomains: ["https://*.seismic-dev.com", "https://*.seismic.com"],
             },
           },
@@ -1432,16 +1435,32 @@ server.registerTool(
   },
   async (args) => {
     const { generatedLivedocId, outputId } = args as { generatedLivedocId: string; outputId: string };
+    const LOG = (msg: string) => { try { fs.appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] PREV: ${msg}\n`); } catch {} };
+    LOG(`gid=${generatedLivedocId} outputId=${outputId}`);
     const res = await apiFetch(`/v3/generatedLivedocs/${generatedLivedocId}/outputs/${outputId}/previewImages`);
+    const bodySnip = JSON.stringify(res.body).slice(0, 400);
+    LOG(`HTTP ${res.status} body=${bodySnip}`);
     if (res.status !== 200) {
       return {
         content: [{ type: "text" as const, text: `Preview images unavailable: HTTP ${res.status}` }],
-        structuredContent: { images: [] },
+        structuredContent: { images: [], httpStatus: res.status },
       };
     }
     const body = res.body as Record<string, unknown>;
-    const images = ((body.previewImages as Array<{ index: number; url: string }>) ?? [])
-      .map(img => ({ index: img.index, url: img.url }));
+    const rawImages = ((body.previewImages ?? body.PreviewImages) as Array<Record<string, unknown>>) ?? [];
+    const imagesMeta = rawImages.map(img => ({
+      index: Number(img.index ?? img.Index ?? 0),
+      url: String(img.url ?? img.Url ?? ""),
+    })).filter(img => img.url);
+    // Filter to known Seismic domains; the panel iframe loads them directly via
+    // the resourceDomains CSP. URLs are now time-expiry signed (no Bearer token needed).
+    const images = imagesMeta.filter(img => {
+      try {
+        const host = new URL(img.url).hostname;
+        return host.endsWith(".seismic.com") || host.endsWith(".seismic-dev.com");
+      } catch { return false; }
+    });
+    LOG(`${images.length} images; url[0]=${images[0]?.url?.slice(0,80) ?? "none"}`);
     return {
       content: [{ type: "text" as const, text: `${images.length} preview images` }],
       structuredContent: { images },
@@ -1475,27 +1494,15 @@ server.registerTool(
           (body.contentThumbnailImageUrls as string[] | undefined)?.[0] ?? body.imageUrl ?? ""
         );
         if (!rawUrl) return { versionId, thumbnailUrl: "" };
-        // Fetch and inline as base64 â€” the App panel iframe cannot load signed CDN URLs cross-origin.
-        // 5s timeout so a single slow image cannot stall the whole batch.
-        // Only attach auth headers when the URL is on a known Seismic domain â€” never leak
-        // the bearer token to a third-party host if the API ever returns an unexpected URL.
-        let thumbnailHeaders: Record<string, string> = {};
-        try {
-          const host = new URL(rawUrl).hostname;
-          if (host.endsWith(".seismic.com") || host.endsWith(".seismic-dev.com")) {
-            thumbnailHeaders = authHeaders() as Record<string, string>;
-          }
-        } catch { /* malformed URL â€” proceed without auth */ }
-        try {
-          const imgRes = await fetch(rawUrl, {
-            headers: thumbnailHeaders,
-            signal: AbortSignal.timeout(5000),
-          });
-          if (!imgRes.ok) return { versionId, thumbnailUrl: rawUrl };
-          const buf = Buffer.from(await imgRes.arrayBuffer());
-          const mime = imgRes.headers.get("content-type") ?? "image/jpeg";
-          return { versionId, thumbnailUrl: `data:${mime};base64,${buf.toString("base64")}` };
-        } catch { return { versionId, thumbnailUrl: rawUrl }; }
+        // Basic allowlist: only pass through URLs on known Seismic domains.
+        let parsedHost: string;
+        try { parsedHost = new URL(rawUrl).hostname; }
+        catch { return { versionId, thumbnailUrl: "" }; }
+        const isSeismicHost = parsedHost.endsWith(".seismic.com") || parsedHost.endsWith(".seismic-dev.com");
+        if (!isSeismicHost) return { versionId, thumbnailUrl: "" };
+        // The App panel iframe can load these URLs directly — the resource registration
+        // sets resourceDomains to *.seismic.com / *.seismic-dev.com in the CSP.
+        return { versionId, thumbnailUrl: rawUrl };
       })
     );
     const thumbnailMap: Record<string, string> = {};

@@ -185,6 +185,85 @@ function DownloadButton({ app, url, fileName, label }) {
   );
 }
 
+function SlidePreview({ images, templateName, downloads, downloadUrls, app, onZoom }) {
+  const [idx, setIdx] = React.useState(0);
+  const thumbsRef = React.useRef(null);
+  const total = images.length;
+  const cur = images[idx];
+  const hasPrev = idx > 0;
+  const hasNext = idx < total - 1;
+
+  React.useEffect(() => {
+    const el = thumbsRef.current?.children[idx];
+    if (el) el.scrollIntoView({ behavior: "smooth", inline: "nearest", block: "nearest" });
+  }, [idx]);
+
+  return (
+    <div style={{ borderRadius: 10, overflow: "hidden", border: "1px solid #dde3ea", boxShadow: "0 2px 12px rgba(0,0,0,.08)" }}>
+      {/* Header */}
+      <div style={{ padding: "12px 16px", background: "#fff", borderBottom: "1px solid #eaeaea", display: "flex", alignItems: "flex-start", justifyContent: "space-between" }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: 15, color: "#1d1d1f" }}>{templateName}</div>
+          <div style={{ fontSize: 11, color: "#888", marginTop: 3 }}>LiveDoc generation · slide preview</div>
+        </div>
+        <div style={{ fontSize: 11, color: "#aaa", marginTop: 2 }}>
+          Version <span style={{ fontWeight: 600, color: "#555" }}>Current</span>
+        </div>
+      </div>
+      {/* Download buttons */}
+      <div style={{ padding: "10px 14px", background: "#fafafa", borderBottom: "1px solid #efefef", display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        {(downloads.length > 0 ? downloads : []).map((dl, i) => (
+          <DownloadButton key={i} app={app} url={dl.url} fileName={dl.fileName} label={`↓ Download ${dl.format.toUpperCase()}`} />
+        ))}
+        {downloads.length === 0 && downloadUrls.map((url, i) => (
+          <DownloadButton key={i} app={app} url={url} fileName={`output-${i + 1}.pptx`} label={`↓ Download ${i + 1}`} />
+        ))}
+      </div>
+      {/* Main slide */}
+      <div style={{ background: "#111", position: "relative", display: "flex", alignItems: "center", justifyContent: "center", padding: "16px 44px", minHeight: 180 }}>
+        {total > 1 && (
+          <button onClick={() => setIdx(i => Math.max(0, i - 1))} disabled={!hasPrev}
+            style={{ position: "absolute", left: 6, top: "50%", transform: "translateY(-50%)",
+              background: hasPrev ? "rgba(255,255,255,.2)" : "rgba(255,255,255,.05)", border: "none",
+              borderRadius: "50%", width: 32, height: 32, fontSize: 22, color: "#fff",
+              cursor: hasPrev ? "pointer" : "default", opacity: hasPrev ? 1 : 0.3,
+              display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1 }}>‹</button>
+        )}
+        <img src={cur.url} alt={`Slide ${idx + 1}`}
+          onClick={() => onZoom && onZoom(idx)}
+          style={{ display: "block", maxWidth: "100%", maxHeight: 280, objectFit: "contain",
+            borderRadius: 4, boxShadow: "0 4px 24px rgba(0,0,0,.6)",
+            cursor: onZoom ? "zoom-in" : "default" }} />
+        {total > 1 && (
+          <button onClick={() => setIdx(i => Math.min(total - 1, i + 1))} disabled={!hasNext}
+            style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)",
+              background: hasNext ? "rgba(255,255,255,.2)" : "rgba(255,255,255,.05)", border: "none",
+              borderRadius: "50%", width: 32, height: 32, fontSize: 22, color: "#fff",
+              cursor: hasNext ? "pointer" : "default", opacity: hasNext ? 1 : 0.3,
+              display: "flex", alignItems: "center", justifyContent: "center", lineHeight: 1 }}>›</button>
+        )}
+      </div>
+      {/* Slide counter */}
+      <div style={{ background: "#111", textAlign: "center", paddingBottom: 12, color: "#777", fontSize: 12 }}>
+        Slide {idx + 1} of {total}
+      </div>
+      {/* Thumbnail strip */}
+      <div ref={thumbsRef} style={{ display: "flex", overflowX: "auto", gap: 6, padding: "10px 12px", background: "#f5f6f8", borderTop: "1px solid #e4e8ed" }}>
+        {images.map((img, i) => (
+          <div key={img.index} onClick={() => setIdx(i)} title={`Slide ${i + 1}`}
+            style={{ flexShrink: 0, width: 80, borderRadius: 5, overflow: "hidden", cursor: "pointer",
+              border: i === idx ? "2.5px solid #0066cc" : "2px solid transparent",
+              boxShadow: i === idx ? "0 0 0 2px #b3cdf7" : "0 1px 3px rgba(0,0,0,.1)",
+              background: "#fff", transition: "border-color .1s" }}>
+            <img src={img.url} alt={`Slide ${i + 1}`}
+              style={{ width: "100%", display: "block", aspectRatio: "16/9", objectFit: "cover" }} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ScalarInput({ field, value, onChange }) {
   const t = (field.type || "STRING").toUpperCase();
   if (t === "BOOL" || t === "BOOLEAN") {
@@ -524,7 +603,7 @@ function FormApp() {
       const nonempty = results.filter(r => r.images.length > 0);
       if (nonempty.length > 0) {
         setPreviews(nonempty);
-        appRef.current?.sendSizeChanged({ width: 520, height: 820 });
+        appRef.current?.sendSizeChanged({ width: 520, height: 680 });
       }
     } finally {
       setPreviewsFetched(true);
@@ -609,50 +688,71 @@ function FormApp() {
   if (phase === "done") {
     const { generatedLivedocId, downloads = [], downloadUrls = [] } = result;
     const app = appRef.current;
+    const primaryPreview = previews[0] ?? null;
+
     return (
       <div style={S.page}>
-        <div style={S.title}>{schema.templateName}</div>
-        <div style={S.okBox}>
-          <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 10 }}>✓ Generation complete!</div>
-          {downloads.length > 0
-            ? downloads.map((dl, i) => (
-                <DownloadButton key={i} app={app} url={dl.url} fileName={dl.fileName} label={`↓ Download ${dl.format.toUpperCase()}`} />
-              ))
-            : downloadUrls.length > 0
-              ? downloadUrls.map((url, i) => (
-                  <DownloadButton key={i} app={app} url={url} fileName={`output-${i + 1}.pptx`} label={`↓ Download ${i + 1}`} />
-                ))
-              : <div style={{ fontSize: 13, marginTop: 6, color: "#555" }}>
-                  ID: <code style={{ fontSize: 12 }}>{generatedLivedocId}</code><br />
-                  Ask Claude to download this document.
-                </div>
-          }
-        </div>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
 
-        {!previewsFetched && downloads.some(d => ["pptx","pdf"].includes((d.format??"").toLowerCase())) && (
-          <div style={{ marginTop: 12, color: "#888", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ ...S.spinner, borderColor: "#ccc", borderTopColor: "#888" }} />
-            Loading preview…
+        {/* ── Slide preview panel (replaces success box once images load) ── */}
+        {previewsFetched && primaryPreview ? (
+          <SlidePreview
+            images={primaryPreview.images}
+            templateName={schema.templateName}
+            downloads={downloads}
+            downloadUrls={downloadUrls}
+            app={app}
+            onZoom={i => setPreviewImg({
+              images: primaryPreview.images.map((img, n) => ({
+                url: img.url,
+                title: `${primaryPreview.format} — Slide ${n + 1} of ${primaryPreview.images.length}`,
+              })),
+              idx: i,
+            })}
+          />
+        ) : (
+          <div style={S.okBox}>
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 10 }}>✓ Generation complete!</div>
+            {downloads.length > 0
+              ? downloads.map((dl, i) => (
+                  <DownloadButton key={i} app={app} url={dl.url} fileName={dl.fileName} label={`↓ Download ${dl.format.toUpperCase()}`} />
+                ))
+              : downloadUrls.length > 0
+                ? downloadUrls.map((url, i) => (
+                    <DownloadButton key={i} app={app} url={url} fileName={`output-${i + 1}.pptx`} label={`↓ Download ${i + 1}`} />
+                  ))
+                : <div style={{ fontSize: 13, marginTop: 6, color: "#555" }}>
+                    ID: <code style={{ fontSize: 12 }}>{generatedLivedocId}</code><br />
+                    Ask Claude to download this document.
+                  </div>
+            }
+            {!previewsFetched && downloads.some(d => ["pptx","pdf"].includes((d.format??"").toLowerCase())) && (
+              <div style={{ marginTop: 10, color: "#888", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ ...S.spinner, borderColor: "#ccc", borderTopColor: "#888" }} />
+                Loading preview…
+              </div>
+            )}
+            {previewsFetched && previews.length === 0 && (
+              <div style={{ marginTop: 10, color: "#aaa", fontSize: 11 }}>No slide preview available for this template.</div>
+            )}
           </div>
         )}
 
-        {previews.map(p => {
-          const lightboxImages = p.images.map((img, n) => ({ url: img.url, title: `${p.format} — Slide ${n + 1} of ${p.images.length}` }));
+        {/* ── Secondary format previews (e.g. PDF when PPTX is primary) ── */}
+        {previewsFetched && previews.length > 1 && previews.slice(1).map(p => {
+          const lbImgs = p.images.map((img, n) => ({ url: img.url, title: `${p.format} — Slide ${n + 1} of ${p.images.length}` }));
           return (
             <div key={p.format} style={{ marginTop: 14 }}>
               <div style={{ ...S.sl, marginBottom: 8 }}>{p.format} Preview — {p.images.length} slide{p.images.length !== 1 ? "s" : ""}</div>
               <div style={{ display: "flex", overflowX: "auto", gap: 8, paddingBottom: 6 }}>
-                {p.images.map((img, idx) => (
-                  <div
-                    key={img.index}
-                    onClick={() => setPreviewImg({ images: lightboxImages, idx })}
+                {p.images.map((img, i) => (
+                  <div key={img.index}
+                    onClick={() => setPreviewImg({ images: lbImgs, idx: i })}
                     style={{ flexShrink: 0, width: 120, height: 80, borderRadius: 5, overflow: "hidden",
                       cursor: "zoom-in", border: "1.5px solid #dde3ea", background: "#f5f5f5",
                       boxShadow: "0 1px 3px rgba(0,0,0,.1)" }}
-                    title={`Slide ${img.index + 1}`}
-                  >
-                    <img src={img.url} alt={`Slide ${img.index + 1}`}
-                      style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                    title={`Slide ${img.index + 1}`}>
+                    <img src={img.url} alt={`Slide ${img.index + 1}`} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
                   </div>
                 ))}
               </div>

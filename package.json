@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "prebuild:views": "node --input-type=module -e \"import {rmSync} from 'fs'; try{rmSync('dist/views',{recursive:true,force:true})}catch{}\"",
     "build:views": "vite build",
     "build:all": "npm run build:views && npm run build",
     "dev": "tsx src/index.ts",

@@ -11,10 +11,23 @@ export async function apiFetch(
   _retry = true
 ): Promise<{ status: number; body: unknown }> {
   const url = `${BASE_URL}${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: { ...authHeaders(), ...(options.headers as Record<string, string> ?? {}) },
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10_000);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers: { ...authHeaders(), ...(options.headers as Record<string, string> ?? {}) },
+      signal: controller.signal,
+    });
+  } catch (err: unknown) {
+    if (err instanceof Error && err.name === "AbortError") {
+      return { status: 0, body: `Request timed out after 10 seconds: ${path}` };
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
   // Auto-refresh token on 401/403 — but never when the token was explicitly set via set_token.
   // 403 "Request not allowed" from Seismic typically means an expired or wrong-scope token.
   // First: try loading a token saved by the panel process (cross-process panel login).

@@ -29,7 +29,7 @@ export function useGenerationPoll({ appRef, tokenRef, setPhase, setErrMsg }) {
         throw new Error("Generation failed" + (detail ? ` — ${detail}` : ""));
       }
     }
-    throw new Error("Generation timed out after 4 minutes");
+    throw new Error(`Generation timed out after 4 minutes. Generation ID: ${id} — ask Claude to check its status or download the output.`);
   }
 
   async function handleSubmit(getBuildPayload, onDone) {

@@ -20,6 +20,7 @@ export function FormApp() {
   const [fmtIdx,         setFmtIdx]         = useState(0);
   const [comboIdx,       setComboIdx]       = useState(0);
   const [thumbs,         setThumbs]         = useState({});
+  const [previewErr,     setPreviewErr]     = useState(null);
 
   // ── Hooks ──────────────────────────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ export function FormApp() {
     setPreviewsFetched(false);
     setPreviewImg(null);
     setThumbs({});
+    setPreviewErr(null);
   }
 
   // Fetch thumbnails for external content candidates whenever schema changes
@@ -83,24 +85,31 @@ export function FormApp() {
   async function fetchPreviews(app, generatedLivedocId, downloads) {
     const previewable = (downloads ?? []).filter(d => ["pptx", "pdf"].includes((d.format ?? "").toLowerCase()));
     if (!previewable.length) { setPreviewsFetched(true); return; }
+    let networkError = false;
     try {
-      const results = await Promise.all(previewable.map(async d => {
-        try {
-          const res = await app.callServerTool({
-            name: "get_preview_images",
-            arguments: { generatedLivedocId, outputId: d.format.toLowerCase() },
-          });
-          const images = (res?.structuredContent?.images ?? [])
+      const settled = await Promise.allSettled(previewable.map(d =>
+        app.callServerTool({
+          name: "get_preview_images",
+          arguments: { generatedLivedocId, outputId: d.format.toLowerCase() },
+        }).then(res => {
+          const sc = res?.structuredContent;
+          if (sc?.httpStatus && sc.httpStatus !== 200) return { format: d.format.toUpperCase(), images: [], unavailable: true };
+          const images = (sc?.images ?? [])
             .filter(img => typeof img.url === "string" && img.url.startsWith("https://"));
-          return { format: d.format.toUpperCase(), images };
-        } catch {
-          return { format: d.format.toUpperCase(), images: [] };
-        }
-      }));
+          return { format: d.format.toUpperCase(), images, unavailable: false };
+        })
+      ));
+      const results = settled.map((s, i) => {
+        if (s.status === "fulfilled") return s.value;
+        networkError = true;
+        return { format: previewable[i].format.toUpperCase(), images: [], unavailable: false };
+      });
       const nonempty = results.filter(r => r.images.length > 0);
       if (nonempty.length > 0) {
         setPreviews(nonempty);
         appRef.current?.sendSizeChanged({ width: 520, height: 680 });
+      } else if (networkError) {
+        setPreviewErr("Preview could not be loaded — network error.");
       }
     } finally {
       setPreviewsFetched(true);
@@ -172,8 +181,11 @@ export function FormApp() {
                 Loading preview…
               </div>
             )}
-            {previewsFetched && previews.length === 0 && (
+            {previewsFetched && previews.length === 0 && !previewErr && (
               <div style={{ marginTop: 10, color: "#aaa", fontSize: 11 }}>No slide preview available for this template.</div>
+            )}
+            {previewErr && (
+              <div style={{ marginTop: 10, color: "#c00", fontSize: 11 }}>{previewErr}</div>
             )}
           </div>
         )}

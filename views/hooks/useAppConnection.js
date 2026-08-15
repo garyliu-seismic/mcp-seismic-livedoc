@@ -23,7 +23,7 @@ export function useAppConnection({ onFormLoad, onError }) {
       const res = await appRef.current.callServerTool({ name: "panel_login", arguments: { tenant, username, password } });
       const sc = res?.structuredContent;
       if (sc?.ok) {
-        setPhase("connecting");
+        setPhase("idle");
       } else {
         setLoginError(sc?.error ?? "Login failed. Check your credentials.");
       }
@@ -52,15 +52,15 @@ export function useAppConnection({ onFormLoad, onError }) {
       const formToken = event?.structuredContent?.formToken;
       if (!formToken) return;
       // Don't hijack an active form — only accept a new schema when idle.
-      if (phaseRef.current !== "connecting") return;
+      if (phaseRef.current !== "idle") return;
       tokenRef.current = formToken;
       phaseRef.current = "loading";
       setPhase("loading");
       try {
         const sc = await loadSchema(app, formToken);
-        onFormLoadRef.current(sc);
+        const resumed = onFormLoadRef.current(sc);
         app.sendSizeChanged({ width: 520, height: 900 });
-        setPhase("ready");
+        if (!resumed) setPhase("ready");
       } catch (e) {
         onErrorRef.current?.(String(e));
         setPhase("error");
@@ -70,7 +70,7 @@ export function useAppConnection({ onFormLoad, onError }) {
     app.connect()
       .then(() => {
         app.callServerTool({ name: "get_auth_status", arguments: {} }).then(res => {
-          if (!res?.structuredContent?.isAuthenticated) setPhase("login");
+          setPhase(res?.structuredContent?.isAuthenticated ? "idle" : "login");
         }).catch(() => {});
       })
       .catch(e => { onErrorRef.current?.(String(e)); setPhase("error"); });
@@ -79,7 +79,7 @@ export function useAppConnection({ onFormLoad, onError }) {
   // Poll for new generation requests when panel is idle
   useEffect(() => {
     const interval = setInterval(async () => {
-      if (phaseRef.current !== "connecting") return;
+      if (phaseRef.current !== "idle") return;
       const app = appRef.current;
       if (!app) return;
       try {
@@ -92,16 +92,16 @@ export function useAppConnection({ onFormLoad, onError }) {
         });
         const sc = res?.structuredContent;
         if (!sc?.isNew || !sc?.formToken) return;
-        if (phaseRef.current !== "connecting") return;
+        if (phaseRef.current !== "idle") return;
 
         tokenRef.current = sc.formToken;
         phaseRef.current = "loading";
         setPhase("loading");
 
         const newSc = await loadSchema(app, sc.formToken);
-        onFormLoadRef.current(newSc);
+        const resumed = onFormLoadRef.current(newSc);
         app.sendSizeChanged({ width: 520, height: 900 });
-        setPhase("ready");
+        if (!resumed) setPhase("ready");
       } catch { /* ignore poll errors */ }
     }, 2500);
     return () => clearInterval(interval);

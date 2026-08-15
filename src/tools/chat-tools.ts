@@ -8,7 +8,7 @@ import { handleSearchTemplates, handleSearchContent } from "../handlers/content.
 import { handleGetInputs, buildFormSchema } from "../handlers/inputs.js";
 import { handleSubmitGeneration, handleGetStatus, handleGetDownloadUrl, handleDownloadGenerationOutput } from "../handlers/generation.js";
 import { generateToken } from "../utils/os-utils.js";
-import { writeSchema, writeLatestToken, readResult } from "../ipc/temp-file.js";
+import { writeSchema, writeLatestToken, readResult, writePrefill, readSchema } from "../ipc/temp-file.js";
 import { FORM_RESOURCE_URI } from "../config.js";
 
 export function registerChatTools(server: McpServer): void {
@@ -90,7 +90,9 @@ export function registerChatTools(server: McpServer): void {
         "Once the user tells you generation is done (or the panel shows 'Generation complete'), " +
         "call get_panel_result with the formToken to get the generatedLivedocId and download URLs, " +
         "then call download_generation_output to save the file locally. " +
-        "Do NOT build your own form, do NOT use AskUserQuestion.",
+        "Do NOT build your own form, do NOT use AskUserQuestion. " +
+        "If the user wants sample/default values filled in, call prefill_livedoc_form_values with the formToken — " +
+        "do NOT call submit_form, get_form_schema, or submit_livedoc_generation yourself; those bypass the form the user is looking at.",
       inputSchema: {
         teamSiteId: z.string().describe("Team site identifier (UUID) that owns the template."),
         libraryContentVersionId: z.string().describe("Content version identifier (UUID) of the LiveDoc template."),
@@ -118,15 +120,110 @@ export function registerChatTools(server: McpServer): void {
       // even when the App panel was already open from a previous run.
       writeLatestToken(formToken);
 
+      // Surface the actual fillable field/table/variable-list names so a subsequent
+      // prefill_livedoc_form_values call uses real names instead of guessing generic ones.
+      const adhocScalars = (schema.adhocScalars as Array<{ name: string; type: string }>) ?? [];
+      const adhocTables = (schema.adhocTables as Array<{ name: string; columns: Array<{ name: string; colType: string }> }>) ?? [];
+      const variableLists = (schema.variableLists as Array<{
+        name: string;
+        scalars: Array<{ name: string; type: string }>;
+        tables: Array<{ name: string; columns: Array<{ name: string; colType: string }> }>;
+      }>) ?? [];
+      const fillableFields = {
+        scalars: adhocScalars.map(f => ({ name: f.name, type: f.type })),
+        tables: adhocTables.map(t => ({ name: t.name, columns: t.columns.map(c => c.name) })),
+        variableLists: variableLists.map(vl => ({
+          name: vl.name,
+          scalars: vl.scalars.map(f => f.name),
+          tables: vl.tables.map(t => ({ name: t.name, columns: t.columns.map(c => c.name) })),
+        })),
+      };
+
       return {
         content: [{
           type: "text" as const,
           text: `Form opened in the App panel (formToken="${formToken}"). ` +
             `The user fills it out and clicks Submit in the panel — generation runs automatically. ` +
             `DO NOT call open_form_ui. DO NOT call submit_form. DO NOT call get_form_result. ` +
-            `Just tell the user to fill the form. When they say it is done, call get_panel_result with formToken="${formToken}".`,
+            `Just tell the user to fill the form. When they say it is done, call get_panel_result with formToken="${formToken}". ` +
+            `If sample/default values were requested, call prefill_livedoc_form_values with formToken="${formToken}" — ` +
+            `use ONLY the exact field/table/variable-list names listed below, never invent your own: ` +
+            JSON.stringify(fillableFields),
         }],
-        structuredContent: { formToken },
+        structuredContent: { formToken, fillableFields },
+      };
+    }
+  );
+
+  server.registerTool(
+    "prefill_livedoc_form_values",
+    {
+      description:
+        "Prefill sample or default values into the LiveDoc input form that get_livedoc_inputs already opened in the App panel. " +
+        "Use this whenever the user asks for sample/default/suggested values — it writes the values into the SAME open form so the " +
+        "user can review and click Submit themselves. Do NOT call submit_form, get_form_schema, or submit_livedoc_generation yourself; " +
+        "those submit generation directly and skip the user's review, which is not what 'fill in sample values' means. " +
+        "Only include field/table/variable-list names that exist in the schema fields you saw from get_livedoc_inputs.",
+      inputSchema: {
+        formToken: z.string().describe("The formToken returned by get_livedoc_inputs."),
+        scalars: z.record(z.string(), z.any()).optional().describe("Map of adhoc scalar field name -> suggested value."),
+        tables: z.record(z.string(), z.array(z.record(z.string(), z.any()))).optional().describe("Map of adhoc table name -> array of row objects keyed by column name."),
+        variableLists: z.record(z.string(), z.object({
+          scalars: z.record(z.string(), z.any()).optional().describe("Map of scalar field name -> suggested value."),
+          tables: z.record(z.string(), z.array(z.record(z.string(), z.any()))).optional().describe("Map of table name -> array of row objects keyed by column name."),
+        })).optional().describe("Map of variable list name -> its scalar/table values."),
+      },
+    },
+    async (args) => {
+      const { formToken, scalars, tables, variableLists } = args as {
+        formToken: string;
+        scalars?: Record<string, unknown>;
+        tables?: Record<string, Array<Record<string, unknown>>>;
+        variableLists?: Record<string, { scalars?: Record<string, unknown>; tables?: Record<string, Array<Record<string, unknown>>> }>;
+      };
+
+      const schema = readSchema(formToken) as {
+        adhocScalars?: Array<{ name: string }>;
+        adhocTables?: Array<{ name: string }>;
+        variableLists?: Array<{ name: string }>;
+      } | null;
+      if (!schema) {
+        return {
+          content: [{ type: "text" as const, text: "error: no form open for this formToken (schema not found)" }],
+          structuredContent: { error: "Schema not found for token" },
+          isError: true,
+        };
+      }
+
+      const validScalars = new Set((schema.adhocScalars ?? []).map(f => f.name));
+      const validTables = new Set((schema.adhocTables ?? []).map(t => t.name));
+      const validVLs = new Set((schema.variableLists ?? []).map(vl => vl.name));
+      const unknown: string[] = [];
+      Object.keys(scalars ?? {}).forEach(k => { if (!validScalars.has(k)) unknown.push(`scalars.${k}`); });
+      Object.keys(tables ?? {}).forEach(k => { if (!validTables.has(k)) unknown.push(`tables.${k}`); });
+      Object.keys(variableLists ?? {}).forEach(k => { if (!validVLs.has(k)) unknown.push(`variableLists.${k}`); });
+      if (unknown.length > 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `error: unknown field name(s): ${unknown.join(", ")}. ` +
+              `Valid names — scalars: ${[...validScalars].join(", ") || "(none)"}; ` +
+              `tables: ${[...validTables].join(", ") || "(none)"}; ` +
+              `variableLists: ${[...validVLs].join(", ") || "(none)"}. ` +
+              `Re-call prefill_livedoc_form_values using only these exact names.`,
+          }],
+          structuredContent: { error: "Unknown field name(s)", unknown },
+          isError: true,
+        };
+      }
+
+      writePrefill(formToken, { scalars, tables, variableLists });
+      return {
+        content: [{
+          type: "text" as const,
+          text: "Sample values sent to the open form. Tell the user their fields have been filled in and ask them to review and click Submit in the panel.",
+        }],
+        structuredContent: { ok: true },
       };
     }
   );

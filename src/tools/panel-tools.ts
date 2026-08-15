@@ -7,7 +7,7 @@ import * as os from "os";
 import { dbg, DEBUG_LOG } from "../utils/debug.js";
 import { getToken, setToken, isTokenManual, setTokenManual } from "../auth/state.js";
 import { jwtExpiresAt } from "../auth/jwt.js";
-import { handleLogin } from "../auth/auto-login.js";
+import { handleLogin, autoLogin } from "../auth/auto-login.js";
 import { apiFetch } from "../api/client.js";
 import { handleGetInputs, buildFormSchema } from "../handlers/inputs.js";
 import { statusName, handleSubmitGeneration, handleGetDownloadUrl } from "../handlers/generation.js";
@@ -16,8 +16,20 @@ import {
   pendingFormSchemas, pendingGenerations,
   readSchema, writeSchema, deleteSchemaFile,
   writeLatestToken, writeResult, readResult, writeGid, readGid,
+  readPrefill, deletePrefillFile,
 } from "../ipc/temp-file.js";
 import { DEFAULT_AUTH_TENANT, DEFAULT_USERNAME, DEFAULT_PASSWORD, FORM_RESOURCE_URI } from "../config.js";
+
+// Same non-expired-token check as apiFetch, but also tries a silent autoLogin() refresh
+// (cached credentials from a prior panel login, or AUTH_* env defaults) before giving up.
+// Without this, the panel would drop to the sign-in screen on every token expiry even when
+// it could have refreshed silently, forcing a needless re-login for an already-signed-in user.
+async function ensureAuthenticated(): Promise<boolean> {
+  const tok = getToken();
+  const exp = tok ? jwtExpiresAt(tok) : null;
+  if (tok && (exp === null || Date.now() < exp - 60_000)) return true;
+  return autoLogin();
+}
 
 export function registerPanelTools(server: McpServer): void {
   // open_livedoc_panel — opens the App panel so the user can sign in or check status
@@ -35,9 +47,7 @@ export function registerPanelTools(server: McpServer): void {
       _meta: { ui: { resourceUri: FORM_RESOURCE_URI } },
     },
     async () => {
-      const tok = getToken();
-      const exp = tok ? jwtExpiresAt(tok) : null;
-      const isAuthenticated = !!tok && (exp === null || Date.now() < exp - 60_000);
+      const isAuthenticated = await ensureAuthenticated();
       return {
         content: [{ type: "text" as const, text: isAuthenticated
           ? "Panel opened. The user is already signed in — proceed with their request."
@@ -88,14 +98,11 @@ export function registerPanelTools(server: McpServer): void {
       _meta: { ui: { visibility: ["app"] } },
     },
     async () => {
-      const tok = getToken();
-      if (!tok) {
+      const isAuthenticated = await ensureAuthenticated();
+      if (!isAuthenticated) {
         return { content: [{ type: "text" as const, text: "not-authenticated" }], structuredContent: { isAuthenticated: false } };
       }
-      const exp = jwtExpiresAt(tok);
-      if (exp !== null && Date.now() >= exp - 60_000) {
-        return { content: [{ type: "text" as const, text: "token-expired" }], structuredContent: { isAuthenticated: false } };
-      }
+      const exp = jwtExpiresAt(getToken());
       return {
         content: [{ type: "text" as const, text: "authenticated" }],
         structuredContent: { isAuthenticated: true, expiresAt: exp ?? null },
@@ -153,16 +160,37 @@ export function registerPanelTools(server: McpServer): void {
   server.registerTool(
     "get_form_schema",
     {
-      description: "Internal: returns the normalised form schema for the given token. Called by the App panel shell.",
+      description: "Internal: returns the normalised form schema for the given token, plus any existingResult already recorded for it " +
+        "(so a panel that (re)mounts mid-generation or after completion — e.g. after a chat refresh — can resume that state " +
+        "instead of showing a blank input form). Called by the App panel shell.",
       inputSchema: { token: z.string() },
       _meta: { ui: { visibility: ["app"] } },
     },
     async (args) => {
       const { token } = args as { token: string };
       const schema = readSchema(token);
+      const existingResult = readResult(token);
       return {
         content: [{ type: "text" as const, text: schema ? "ok" : "schema-not-found" }],
-        ...(schema ? { structuredContent: schema as Record<string, unknown> } : {}),
+        ...(schema ? { structuredContent: { ...(schema as Record<string, unknown>), existingResult: existingResult ?? null } } : {}),
+      };
+    }
+  );
+
+  server.registerTool(
+    "get_form_prefill",
+    {
+      description: "Internal: returns any sample/default values submitted via prefill_livedoc_form_values for this form token, if present. " +
+        "Called by the App panel while a form is open and unsubmitted.",
+      inputSchema: { token: z.string() },
+      _meta: { ui: { visibility: ["app"] } },
+    },
+    async (args) => {
+      const { token } = args as { token: string };
+      const prefill = readPrefill(token);
+      return {
+        content: [{ type: "text" as const, text: prefill ? "ok" : "no-prefill" }],
+        structuredContent: { prefill: prefill ?? null },
       };
     }
   );
@@ -219,6 +247,7 @@ export function registerPanelTools(server: McpServer): void {
         // Schema is now in the map (readSchema set it). Delete the disk file.
         deleteSchemaFile(token);
       }
+      deletePrefillFile(token);
       if (!schema) {
         return { content: [{ type: "text" as const, text: "error: schema not found" }], structuredContent: { error: "Schema not found for token" } };
       }

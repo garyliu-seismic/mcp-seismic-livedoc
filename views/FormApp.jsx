@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import S from "./styles.js";
 import { useAppConnection } from "./hooks/useAppConnection.js";
 import { useFormState } from "./hooks/useFormState.js";
@@ -34,10 +34,12 @@ export function FormApp() {
           grpInc, setGrpInc, extSel, setExtSel, buildPayload } = useFormState(schema);
 
   // 3. Generation lifecycle (needs setPhase from step 1)
-  const { result, pollMsg, handleSubmit, resetResult } =
+  const { result, pollMsg, handleSubmit, resetResult, resumeFromResult } =
     useGenerationPoll({ appRef, tokenRef, setPhase, setErrMsg });
 
-  // Reset all display state when a new form loads
+  // Reset all display state when a new form loads. Returns true if an existing result was
+  // found and resumed (e.g. after a chat refresh remounted the panel mid/post-generation) —
+  // the caller should then skip its own transition to the blank "ready" input form.
   function handleFormLoad(sc) {
     setSchema(sc);
     setFmtIdx(0);
@@ -50,6 +52,11 @@ export function FormApp() {
     setPreviewImg(null);
     setThumbs({});
     setPreviewErr(null);
+
+    if (sc.existingResult) {
+      return resumeFromResult(sc.existingResult, (gid, dls) => fetchPreviews(appRef.current, gid, dls));
+    }
+    return false;
   }
 
   // Fetch thumbnails for external content candidates whenever schema changes
@@ -79,6 +86,40 @@ export function FormApp() {
       setThumbs(prev => ({ ...prev, ...map }));
     }).catch(() => {});
   }, [schema]);
+
+  // Poll for AI-suggested sample values pushed via prefill_livedoc_form_values.
+  // Stops as soon as a prefill is found, or after ~45s if none ever arrives.
+  const prefillFoundRef = useRef(false);
+  useEffect(() => {
+    if (phase !== "ready" || !schema) return;
+    prefillFoundRef.current = false;
+    let attempts = 0;
+    const interval = setInterval(async () => {
+      if (prefillFoundRef.current) return;
+      if (++attempts > 30) { clearInterval(interval); return; }
+      const app = appRef.current;
+      if (!app) return;
+      try {
+        const res = await app.callServerTool({ name: "get_form_prefill", arguments: { token: tokenRef.current } });
+        const prefill = res?.structuredContent?.prefill;
+        if (!prefill) return;
+        prefillFoundRef.current = true;
+        clearInterval(interval);
+        if (prefill.scalars) setScalars(p => ({ ...p, ...prefill.scalars }));
+        if (prefill.tables) setTables(p => ({ ...p, ...prefill.tables }));
+        if (prefill.variableLists) {
+          const vs = {}, vt = {};
+          Object.entries(prefill.variableLists).forEach(([vlName, vl]) => {
+            Object.entries(vl.scalars ?? {}).forEach(([k, v]) => { vs[`${vlName}|${k}`] = v; });
+            Object.entries(vl.tables ?? {}).forEach(([k, v]) => { vt[`${vlName}|${k}`] = v; });
+          });
+          if (Object.keys(vs).length) setVlScalars(p => ({ ...p, ...vs }));
+          if (Object.keys(vt).length) setVlTables(p => ({ ...p, ...vt }));
+        }
+      } catch { /* ignore poll errors */ }
+    }, 1500);
+    return () => clearInterval(interval);
+  }, [phase, schema]);
 
   // ── Preview images ─────────────────────────────────────────────────────────
 
@@ -123,6 +164,15 @@ export function FormApp() {
       <div style={{ ...S.page, display: "flex", alignItems: "center", gap: 10, color: "#888", padding: 32 }}>
         <span style={{ ...S.spinner, borderColor: "#888", borderTopColor: "transparent" }} />
         {phase === "connecting" ? "Connecting…" : "Loading form…"}
+      </div>
+    );
+  }
+
+  if (phase === "idle") {
+    return (
+      <div style={{ ...S.page, display: "flex", alignItems: "center", gap: 10, color: "#888", padding: 32 }}>
+        <span style={{ color: "#2ea04f", fontWeight: 700 }}>✓</span>
+        Signed in — waiting for a request…
       </div>
     );
   }

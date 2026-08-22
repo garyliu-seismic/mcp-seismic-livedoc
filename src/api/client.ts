@@ -5,6 +5,8 @@ import { getToken, setToken, isTokenManual, getCachedUsername, getCachedPassword
 import { autoLogin } from "../auth/auto-login.js";
 import { dbg } from "../utils/debug.js";
 
+const REQUEST_TIMEOUT_MS = 30_000;
+
 export async function apiFetch(
   path: string,
   options: RequestInit = {},
@@ -12,7 +14,7 @@ export async function apiFetch(
 ): Promise<{ status: number; body: unknown }> {
   const url = `${BASE_URL}${path}`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let res: Response;
   try {
     res = await fetch(url, {
@@ -22,7 +24,7 @@ export async function apiFetch(
     });
   } catch (err: unknown) {
     if (err instanceof Error && err.name === "AbortError") {
-      return { status: 0, body: `Request timed out after 10 seconds: ${path}` };
+      return { status: 0, body: `Request timed out after ${REQUEST_TIMEOUT_MS / 1_000} seconds: ${path}` };
     }
     throw err;
   } finally {

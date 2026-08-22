@@ -21,6 +21,8 @@ export function FormApp() {
   const [comboIdx,       setComboIdx]       = useState(0);
   const [thumbs,         setThumbs]         = useState({});
   const [previewErr,     setPreviewErr]     = useState(null);
+  const [errors,         setErrors]         = useState({ scalars: {}, vlScalars: {}, tables: {} });
+  const [wizStep,        setWizStep]        = useState(0);
 
   // ── Hooks ──────────────────────────────────────────────────────────────────
 
@@ -31,7 +33,7 @@ export function FormApp() {
   // 2. Form values (resets automatically when schema changes)
   const { scalars, setScalars, tables, setTables,
           vlScalars, setVlScalars, vlTables, setVlTables,
-          grpInc, setGrpInc, extSel, setExtSel, buildPayload } = useFormState(schema);
+          grpInc, setGrpInc, extSel, setExtSel, buildPayload, validateAll } = useFormState(schema);
 
   // 3. Generation lifecycle (needs setPhase from step 1)
   const { result, pollMsg, handleSubmit, resetResult, resumeFromResult } =
@@ -52,6 +54,8 @@ export function FormApp() {
     setPreviewImg(null);
     setThumbs({});
     setPreviewErr(null);
+    setErrors({ scalars: {}, vlScalars: {}, tables: {} });
+    setWizStep(0);
 
     if (sc.existingResult) {
       return resumeFromResult(sc.existingResult, (gid, dls) => fetchPreviews(appRef.current, gid, dls));
@@ -287,31 +291,138 @@ export function FormApp() {
 
   // ── Ready: render full form ────────────────────────────────────────────────
 
-  const { adhocScalars = [], adhocTables = [], variableLists = [], slideGroups = [], externalContent = [], formOptions = [] } = schema;
+  const { adhocScalars = [], adhocTables = [], variableLists = [], slideGroups = [], externalContent = [], formOptions = [], pageGroups = [] } = schema;
   const multiForm = formOptions.length > 1;
   const activeFmtOpt = formOptions[fmtIdx] ?? {};
   const combos = activeFmtOpt.outputCombos ?? [];
+
+  // Wizard mode — when a template has several distinct groups (input fields, one or more
+  // variable lists, content selection), one long scrolling form gets unwieldy. Split into
+  // pages with Next/Back instead.
+  //
+  // Prefer the template author's own page boundaries (pageGroups, from the form definition's
+  // FormElements tree) when available — that's the real structure they designed. Each
+  // variable list always gets its own page regardless (variable lists come from a different
+  // endpoint than FormElements, so they can't be matched into pageGroups).
+  const usePageGroups = pageGroups.length > 1;
+  const pageFieldSets = usePageGroups ? pageGroups.map(pg => new Set(pg.fieldNames)) : [];
+  const scalarInPage = (idx, name) => pageFieldSets[idx]?.has(name) ?? false;
+  const tableInPage = (idx, t) => scalarInPage(idx, t.name) || t.columns.some(c => scalarInPage(idx, c.name));
+
+  const inputSections = usePageGroups
+    ? pageGroups.map((pg, i) => ({ key: `page:${i}`, label: pg.label }))
+    : ((adhocScalars.length > 0 || adhocTables.length > 0) ? [{ key: "inputs", label: "Inputs" }] : []);
+  const sections = [
+    ...inputSections,
+    ...variableLists.map((vl, i) => ({ key: `vl:${i}`, label: vl.name })),
+    ...((slideGroups.length > 0 || externalContent.length > 0) ? [{ key: "content", label: "Content" }] : []),
+    { key: "output", label: "Output" },
+  ];
+  // Trigger pagination on GROUP count (distinct sections a user has to scroll past), not raw
+  // field count — a template with 3 small variable lists is just as cluttered as one with 8
+  // scalar fields. Real template-authored pages always page regardless of count.
+  const groupCount = sections.length - 1; // exclude the always-present "Output" step
+  const useWizard = usePageGroups || groupCount > 2;
+  const step = useWizard ? Math.min(wizStep, sections.length - 1) : 0;
+  const currentKey = sections[step]?.key;
+  const currentVlIdx = currentKey?.startsWith("vl:") ? Number(currentKey.split(":")[1]) : null;
+  const showSection = key => !useWizard || currentKey === key;
+
+  // Scalars/tables belonging to an ARBITRARY section key — used for whatever the current
+  // step is (visibleScalars/visibleTables below) and to check OTHER sections when scanning
+  // for the first erroring page on failed submit.
+  function fieldsForKey(key) {
+    if (key === "inputs") return { scalars: adhocScalars, tables: adhocTables };
+    if (key.startsWith("page:")) {
+      const idx = Number(key.split(":")[1]);
+      return {
+        scalars: adhocScalars.filter(f => scalarInPage(idx, f.name)),
+        tables: adhocTables.filter(t => tableInPage(idx, t)),
+      };
+    }
+    return { scalars: [], tables: [] };
+  }
+
+  // Which scalars/tables belong on the CURRENT step — page-scoped when using real pages,
+  // otherwise the whole "inputs" bucket at once (matches the old heuristic behavior).
+  const { scalars: visibleScalars, tables: visibleTables } = !useWizard
+    ? { scalars: adhocScalars, tables: adhocTables }
+    : fieldsForKey(currentKey ?? "");
+  // Separate "show all" (wizard off) from "wizard on but this isn't a vl: step" (show none) —
+  // both cases could naively collapse to currentVlIdx === null, which would show every
+  // variable list on every non-vl step (e.g. the Inputs page) instead of none of them.
+  const showAllVariableLists = !useWizard;
+
+  function validatePage(key, v) {
+    if (key.startsWith("vl:")) {
+      const vl = variableLists[Number(key.split(":")[1])];
+      if (!vl) return true;
+      return vl.scalars.every(f => !v.vlScalars[`${vl.name}|${f.name}`])
+        && vl.tables.every(t => !v.tables[`${vl.name}|${t.name}`]);
+    }
+    if (key === "inputs" || key.startsWith("page:")) {
+      const { scalars, tables } = fieldsForKey(key);
+      const scalarNames = new Set(scalars.map(f => f.name));
+      const tableNames = new Set(tables.map(t => t.name));
+      return Object.keys(v.scalars).every(n => !scalarNames.has(n))
+        && Object.keys(v.tables).every(n => !tableNames.has(n));
+    }
+    return true;
+  }
+
+  function goNext() {
+    const v = validateAll(schema);
+    setErrors(v);
+    if (!validatePage(currentKey, v)) return;
+    setWizStep(s => Math.min(s + 1, sections.length - 1));
+  }
+
+  function trySubmit() {
+    const v = validateAll(schema);
+    setErrors(v);
+    const hasErrors = Object.keys(v.scalars).length > 0 || Object.keys(v.vlScalars).length > 0 || Object.keys(v.tables).length > 0;
+    if (hasErrors) {
+      if (useWizard) {
+        // Jump back to the first step (in document order) that actually has an error.
+        const badIdx = sections.findIndex(s => !validatePage(s.key, v));
+        if (badIdx >= 0) setWizStep(badIdx);
+      }
+      return;
+    }
+    handleSubmit(
+      () => buildPayload({ schema, fmtIdx, comboIdx, manualOutputFmts }),
+      (gid, dls) => fetchPreviews(appRef.current, gid, dls)
+    );
+  }
 
   return (
     <div style={S.page}>
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
       <div style={S.title}>{schema.templateName}</div>
 
-      {adhocScalars.length > 0 && (
+      {useWizard && (
+        <div style={S.wizDots}>
+          {sections.map((s, i) => (
+            <div key={s.key} title={s.label} style={{ ...S.wizDot, ...(i === step ? S.wizDotOn : {}) }} />
+          ))}
+        </div>
+      )}
+
+      {visibleScalars.length > 0 && (
         <div style={S.grid}>
-          {adhocScalars.map(f => (
-            <ScalarInput key={f.name} field={f} value={scalars[f.name]}
+          {visibleScalars.map(f => (
+            <ScalarInput key={f.name} field={f} value={scalars[f.name]} error={errors.scalars[f.name]}
               onChange={v => setScalars(p => ({ ...p, [f.name]: v }))} />
           ))}
         </div>
       )}
 
-      {adhocTables.map(t => (
-        <TableInput key={t.name} table={t} rows={tables[t.name] ?? []}
+      {visibleTables.map(t => (
+        <TableInput key={t.name} table={t} rows={tables[t.name] ?? []} error={errors.tables[t.name]}
           onChange={rows => setTables(p => ({ ...p, [t.name]: rows }))} />
       ))}
 
-      {variableLists.map(vl => (
+      {variableLists.map((vl, i) => (showAllVariableLists || currentVlIdx === i) && (
         <div key={vl.name} style={S.section}>
           <div style={S.sl}>
             Variable list — {vl.name}
@@ -321,18 +432,20 @@ export function FormApp() {
             <div style={S.grid}>
               {vl.scalars.map(f => (
                 <ScalarInput key={f.name} field={f} value={vlScalars[`${vl.name}|${f.name}`]}
+                  error={errors.vlScalars[`${vl.name}|${f.name}`]}
                   onChange={v => setVlScalars(p => ({ ...p, [`${vl.name}|${f.name}`]: v }))} />
               ))}
             </div>
           )}
           {vl.tables.map(t => (
             <TableInput key={t.name} table={t} rows={vlTables[`${vl.name}|${t.name}`] ?? []}
+              error={errors.tables[`${vl.name}|${t.name}`]}
               onChange={rows => setVlTables(p => ({ ...p, [`${vl.name}|${t.name}`]: rows }))} />
           ))}
         </div>
       ))}
 
-      {slideGroups.length > 0 && (
+      {showSection("content") && slideGroups.length > 0 && (
         <div style={S.section}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <div style={S.sl}>Content selection</div>
@@ -381,7 +494,7 @@ export function FormApp() {
         </div>
       )}
 
-      {externalContent.length > 0 && (
+      {showSection("content") && externalContent.length > 0 && (
         <div style={S.section}>
           <div style={S.sl}>External content</div>
           {externalContent.map(slot => (
@@ -463,7 +576,7 @@ export function FormApp() {
         </div>
       )}
 
-      {multiForm && (
+      {showSection("output") && multiForm && (
         <div style={{ marginBottom: 14 }}>
           <div style={S.sl}>Select form</div>
           <div>
@@ -477,7 +590,7 @@ export function FormApp() {
         </div>
       )}
 
-      {combos.length > 1 && (
+      {showSection("output") && combos.length > 1 && (
         <div style={{ marginBottom: 14 }}>
           <div style={S.sl}>Output format</div>
           <div>
@@ -493,7 +606,7 @@ export function FormApp() {
           </div>
         </div>
       )}
-      {combos.length === 1 && combos[0].length > 0 && (
+      {showSection("output") && combos.length === 1 && combos[0].length > 0 && (
         <div style={{ marginBottom: 14 }}>
           <div style={S.sl}>Output format</div>
           <button style={{ ...S.pill, ...S.pillOn }}>
@@ -501,7 +614,7 @@ export function FormApp() {
           </button>
         </div>
       )}
-      {(combos.length === 0 || (combos.length === 1 && combos[0].length === 0)) && (
+      {showSection("output") && (combos.length === 0 || (combos.length === 1 && combos[0].length === 0)) && (
         <div style={{ marginBottom: 14 }}>
           <div style={S.sl}>Output format</div>
           {["PPTX", "PDF", "PPTX + PDF"].map(opt => {
@@ -517,15 +630,22 @@ export function FormApp() {
         </div>
       )}
 
-      <button
-        onClick={() => handleSubmit(
-          () => buildPayload({ schema, fmtIdx, comboIdx, manualOutputFmts }),
-          (gid, dls) => fetchPreviews(appRef.current, gid, dls)
-        )}
-        style={S.sub}
-      >
-        ▶ Submit generation
-      </button>
+      {useWizard ? (
+        <div style={S.wizNav}>
+          <button onClick={() => setWizStep(s => Math.max(s - 1, 0))} disabled={step === 0}
+            style={{ ...S.wizBtn, ...(step === 0 ? { opacity: 0.4, cursor: "default" } : {}) }}>
+            ← Back
+          </button>
+          {step < sections.length - 1
+            ? <button onClick={goNext} style={{ ...S.wizBtn, background: "#0066cc", color: "#fff", borderColor: "#0066cc" }}>Next →</button>
+            : <button onClick={trySubmit} style={{ ...S.sub, marginTop: 0, width: "auto", padding: "8px 22px" }}>▶ Submit generation</button>
+          }
+        </div>
+      ) : (
+        <button onClick={trySubmit} style={S.sub}>
+          ▶ Submit generation
+        </button>
+      )}
 
       {previewImg && (
         <Lightbox

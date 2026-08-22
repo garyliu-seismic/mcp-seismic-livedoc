@@ -6,6 +6,7 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 import { handleSearchTemplates, handleSearchContent } from "../handlers/content.js";
 import { handleGetInputs, buildFormSchema } from "../handlers/inputs.js";
+import { handleGetFormDefinition } from "../handlers/formDefinition.js";
 import { handleSubmitGeneration, handleGetStatus, handleGetDownloadUrl, handleDownloadGenerationOutput } from "../handlers/generation.js";
 import { generateToken } from "../utils/os-utils.js";
 import { writeSchema, writeLatestToken, readResult, writePrefill, readSchema } from "../ipc/temp-file.js";
@@ -389,6 +390,26 @@ export function registerChatTools(server: McpServer): void {
     },
     async (args) => {
       const result = await handleDownloadGenerationOutput(args as { generatedLivedocId: string; outputId: string; autoOpen?: boolean });
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.registerTool(
+    "get_form_definition",
+    {
+      description:
+        "Read the raw form definition for a specific LiveDoc form — its field validation rules (required, min/max length, min/max value, regex pattern) " +
+        "and any STATIC domain-of-value (DOV) lists (fixed dropdown choices embedded in the form, not backed by a data source). " +
+        "The formId comes from get_livedoc_inputs' response (schema.formOptions[].id). " +
+        "This is for inspection only — get_livedoc_inputs already merges this same validation/options data into the form it opens, " +
+        "so you normally don't need to call this yourself unless the user explicitly asks about field constraints or allowed values.",
+      inputSchema: {
+        formId: z.string().describe("Form identifier, from get_livedoc_inputs' schema.formOptions[].id."),
+        teamSiteId: z.string().describe("Team site identifier (UUID) that owns the template."),
+      },
+    },
+    async (args) => {
+      const result = await handleGetFormDefinition(args as { formId: string; teamSiteId: string });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     }
   );

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { coerce, tableValue } from "../utils/formUtils.js";
+import { coerce, tableValue, validateField, validateTableRequired } from "../utils/formUtils.js";
 
 export function useFormState(schema) {
   const [scalars,   setScalars]   = useState({});
@@ -11,14 +11,19 @@ export function useFormState(schema) {
 
   useEffect(() => {
     if (!schema) return;
+    // Prefill from the template's own DataSetting.DefaultValue when the form definition
+    // provided one — a literal default from the template author, distinct from (and applied
+    // before) any AI-suggested values pushed later via prefill_livedoc_form_values.
+    const initScalarValue = f => f.defaultValue !== undefined ? coerce(f.defaultValue, f.type) : "";
+
     const initScalars = {};
-    (schema.adhocScalars ?? []).forEach(f => { initScalars[f.name] = ""; });
+    (schema.adhocScalars ?? []).forEach(f => { initScalars[f.name] = initScalarValue(f); });
     const initTables = {};
     (schema.adhocTables ?? []).forEach(t => { initTables[t.name] = []; });
     const initVlScalars = {};
     const initVlTables  = {};
     (schema.variableLists ?? []).forEach(vl => {
-      (vl.scalars ?? []).forEach(f => { initVlScalars[`${vl.name}|${f.name}`] = ""; });
+      (vl.scalars ?? []).forEach(f => { initVlScalars[`${vl.name}|${f.name}`] = initScalarValue(f); });
       (vl.tables  ?? []).forEach(t => { initVlTables[`${vl.name}|${t.name}`]  = []; });
     });
     const initGrp = {};
@@ -91,6 +96,38 @@ export function useFormState(schema) {
     return payload;
   }
 
+  // Validates all scalar fields (adhoc + variable-list) against their `validation` metadata.
+  // Returns { scalars: {name: err}, vlScalars: {"vlName|name": err} } — only entries with an
+  // actual error are included, so `Object.keys(...).length === 0` means "no errors".
+  function validateAll(sc) {
+    const scalarErrs = {};
+    (sc.adhocScalars ?? []).forEach(f => {
+      const err = validateField(scalars[f.name], f);
+      if (err) scalarErrs[f.name] = err;
+    });
+    const vlScalarErrs = {};
+    (sc.variableLists ?? []).forEach(vl => {
+      (vl.scalars ?? []).forEach(f => {
+        const key = `${vl.name}|${f.name}`;
+        const err = validateField(vlScalars[key], f);
+        if (err) vlScalarErrs[key] = err;
+      });
+    });
+    const tableErrs = {};
+    (sc.adhocTables ?? []).forEach(t => {
+      const err = validateTableRequired(tables[t.name] ?? [], t.columns);
+      if (err) tableErrs[t.name] = err;
+    });
+    (sc.variableLists ?? []).forEach(vl => {
+      (vl.tables ?? []).forEach(t => {
+        const key = `${vl.name}|${t.name}`;
+        const err = validateTableRequired(vlTables[key] ?? [], t.columns);
+        if (err) tableErrs[key] = err;
+      });
+    });
+    return { scalars: scalarErrs, vlScalars: vlScalarErrs, tables: tableErrs };
+  }
+
   return {
     scalars, setScalars,
     tables, setTables,
@@ -99,5 +136,6 @@ export function useFormState(schema) {
     grpInc, setGrpInc,
     extSel, setExtSel,
     buildPayload,
+    validateAll,
   };
 }

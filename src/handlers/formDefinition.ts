@@ -213,8 +213,13 @@ export interface PageGroup {
   label: string;
   // Bound variable names found in this page's subtree — includes both the qualified
   // ("Table.Column") and, where unambiguous, bare suffix form, so the frontend can match
-  // against either adhocScalars/adhocTables names or raw bind names.
+  // against either adhocScalars/adhocTables names or raw bind names. Only fields bound to
+  // AD_HOC (i.e. adhoc scalars/tables) land here.
   fieldNames: string[];
+  // Names of real (non-AD_HOC) variable lists bound anywhere in this page's subtree — a page
+  // can be dedicated entirely to one variable list's fields, in which case fieldNames is empty
+  // and the frontend must render the matching variableLists[] entry instead.
+  variableListNames: string[];
 }
 
 /**
@@ -226,26 +231,35 @@ export function extractPageGroups(rawEnvelope: Record<string, unknown>): PageGro
   const root = (gf(rawEnvelope, "serviceResult") as Record<string, unknown> | undefined) ?? rawEnvelope;
   const elements = (gf(root, "formElements") as Array<Record<string, unknown>> | undefined) ?? [];
 
-  const collectBoundNames = (el: Record<string, unknown>, names: Set<string>) => {
+  // A field's BindVariableListName is "AD_HOC" for adhoc scalars/tables, or the real variable
+  // list's name (e.g. "SQL0526_1") when bound to one. Fields bound to a real list never appear
+  // in adhocScalars/adhocTables, so their names must NOT be added to fieldNames — the frontend
+  // renders those via variableListNames instead (see FormApp.jsx pageVlIndices).
+  const collectBoundNames = (el: Record<string, unknown>, names: Set<string>, listNames: Set<string>) => {
     const bind = gf(el, "bindVariableFullName");
-    if (typeof bind === "string" && bind) {
+    const listName = gf(el, "bindVariableListName");
+    const isRealList = typeof listName === "string" && listName && listName !== "AD_HOC";
+    if (isRealList) {
+      listNames.add(listName);
+    } else if (typeof bind === "string" && bind) {
       names.add(bind);
       const dot = bind.lastIndexOf(".");
       if (dot !== -1) names.add(bind.slice(dot + 1));
     }
     const children = gf(el, "childElements") as Array<Record<string, unknown>> | undefined;
-    (children ?? []).forEach(c => collectBoundNames(c, names));
+    (children ?? []).forEach(c => collectBoundNames(c, names, listNames));
   };
 
   const groups: PageGroup[] = [];
   const visit = (el: Record<string, unknown>) => {
     if (Number(gf(el, "type")) === PAGE_ELEMENT_TYPE) {
       const names = new Set<string>();
-      collectBoundNames(el, names);
-      if (names.size > 0) {
+      const listNames = new Set<string>();
+      collectBoundNames(el, names, listNames);
+      if (names.size > 0 || listNames.size > 0) {
         const basic = gf(el, "basicSetting") as Record<string, unknown> | undefined;
         const label = String((basic && gf(basic, "label")) ?? gf(el, "name") ?? `Page ${groups.length + 1}`);
-        groups.push({ id: String(gf(el, "id") ?? `page-${groups.length}`), label, fieldNames: [...names] });
+        groups.push({ id: String(gf(el, "id") ?? `page-${groups.length}`), label, fieldNames: [...names], variableListNames: [...listNames] });
       }
       return; // don't recurse into a page's own children looking for nested pages
     }
@@ -254,7 +268,7 @@ export function extractPageGroups(rawEnvelope: Record<string, unknown>): PageGro
   };
   elements.forEach(visit);
 
-  log(`found ${groups.length} page group(s): ${groups.map(g => `${g.label}(${g.fieldNames.length})`).join(", ") || "(none)"}`);
+  log(`found ${groups.length} page group(s): ${groups.map(g => `${g.label}(${g.fieldNames.length} field(s), lists=[${g.variableListNames.join(",")}])`).join(", ") || "(none)"}`);
   return groups.length > 1 ? groups : [];
 }
 

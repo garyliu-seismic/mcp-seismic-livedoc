@@ -309,12 +309,26 @@ export function FormApp() {
   const scalarInPage = (idx, name) => pageFieldSets[idx]?.has(name) ?? false;
   const tableInPage = (idx, t) => scalarInPage(idx, t.name) || t.columns.some(c => scalarInPage(idx, c.name));
 
+  // A page can be dedicated entirely to a real (non-AD_HOC) variable list's fields — those
+  // never appear in adhocScalars/adhocTables, so fieldNames alone can't find them. Match each
+  // page's variableListNames against the fetched variableLists[] by name so that page renders
+  // the variable list inline instead of coming up blank (see formDefinition.ts PageGroup).
+  const vlIndexByName = new Map(variableLists.map((vl, i) => [vl.name.toLowerCase(), i]));
+  const pageVlIndices = usePageGroups
+    ? pageGroups.map(pg => (pg.variableListNames ?? [])
+        .map(n => vlIndexByName.get(n.toLowerCase()))
+        .filter(i => i !== undefined))
+    : [];
+  const coveredVlIndices = new Set(pageVlIndices.flat());
+
   const inputSections = usePageGroups
     ? pageGroups.map((pg, i) => ({ key: `page:${i}`, label: pg.label }))
     : ((adhocScalars.length > 0 || adhocTables.length > 0) ? [{ key: "inputs", label: "Inputs" }] : []);
   const sections = [
     ...inputSections,
-    ...variableLists.map((vl, i) => ({ key: `vl:${i}`, label: vl.name })),
+    ...variableLists
+      .map((vl, i) => ({ key: `vl:${i}`, label: vl.name, i }))
+      .filter(s => !coveredVlIndices.has(s.i)),
     ...((slideGroups.length > 0 || externalContent.length > 0) ? [{ key: "content", label: "Content" }] : []),
     { key: "output", label: "Output" },
   ];
@@ -326,6 +340,8 @@ export function FormApp() {
   const step = useWizard ? Math.min(wizStep, sections.length - 1) : 0;
   const currentKey = sections[step]?.key;
   const currentVlIdx = currentKey?.startsWith("vl:") ? Number(currentKey.split(":")[1]) : null;
+  const currentPageIdx = currentKey?.startsWith("page:") ? Number(currentKey.split(":")[1]) : null;
+  const vlVisibleOnCurrentPage = i => currentPageIdx !== null && (pageVlIndices[currentPageIdx] ?? []).includes(i);
   const showSection = key => !useWizard || currentKey === key;
 
   // Scalars/tables belonging to an ARBITRARY section key — used for whatever the current
@@ -364,8 +380,21 @@ export function FormApp() {
       const { scalars, tables } = fieldsForKey(key);
       const scalarNames = new Set(scalars.map(f => f.name));
       const tableNames = new Set(tables.map(t => t.name));
-      return Object.keys(v.scalars).every(n => !scalarNames.has(n))
+      const noAdhocErrors = Object.keys(v.scalars).every(n => !scalarNames.has(n))
         && Object.keys(v.tables).every(n => !tableNames.has(n));
+      if (!noAdhocErrors) return false;
+      // Also check any variable list(s) rendered inline on this page (see pageVlIndices).
+      if (key.startsWith("page:")) {
+        const idx = Number(key.split(":")[1]);
+        for (const vlI of pageVlIndices[idx] ?? []) {
+          const vl = variableLists[vlI];
+          if (!vl) continue;
+          const vlOk = vl.scalars.every(f => !v.vlScalars[`${vl.name}|${f.name}`])
+            && vl.tables.every(t => !v.tables[`${vl.name}|${t.name}`]);
+          if (!vlOk) return false;
+        }
+      }
+      return true;
     }
     return true;
   }
@@ -422,7 +451,7 @@ export function FormApp() {
           onChange={rows => setTables(p => ({ ...p, [t.name]: rows }))} />
       ))}
 
-      {variableLists.map((vl, i) => (showAllVariableLists || currentVlIdx === i) && (
+      {variableLists.map((vl, i) => (showAllVariableLists || currentVlIdx === i || vlVisibleOnCurrentPage(i)) && (
         <div key={vl.name} style={S.section}>
           <div style={S.sl}>
             Variable list — {vl.name}

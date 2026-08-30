@@ -6,8 +6,30 @@ import {
   submitUcbWorkspaceGeneration,
   getUcbWorkspaceGenerationStatus,
 } from "../handlers/ucbWorkspace.js";
+import { handleFindDocCenterProfile } from "../handlers/profile.js";
 
 export function registerUcbWorkspaceTools(server: McpServer): void {
+  server.registerTool(
+    "find_doccenter_profile",
+    {
+      description:
+        "Resolve a DocCenter profile's profileId and profileVersionId by profile name (and optionally teamSiteId). " +
+        "Use this to fill in submit_ucb_workspace_generation's `origin.profileId`/`origin.profileVersionId` when the " +
+        "user only gave you a profile name. If the target content is already published to a profile, " +
+        "search_livedoc_templates/search_livedoc_content may return contentProfiles/profileVersionIds directly on " +
+        "the matching result — check there first before calling this tool. " +
+        "Does NOT resolve `origin.contentLocation`; ask the user for that.",
+      inputSchema: {
+        profileName: z.string().describe("Exact or partial DocCenter profile name to look up."),
+        teamSiteId: z.string().optional().describe("Team site id to disambiguate when multiple teamsites have a profile with this name."),
+      },
+    },
+    async (args) => {
+      const result = await handleFindDocCenterProfile(args as { profileName: string; teamSiteId?: string });
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
   server.registerTool(
     "list_workspace_spaces",
     {
@@ -50,9 +72,10 @@ export function registerUcbWorkspaceTools(server: McpServer): void {
         "Submit a LiveDoc generation whose output is written directly into a Seismic Workspace folder as a " +
         "linked file, instead of being downloaded. Requires exactly one output format. " +
         "IMPORTANT: the `origin` fields (profileId, profileVersionId, contentLocation) identify which DocCenter " +
-        "profile/location this generation is being published against — they are NOT returned by " +
-        "search_livedoc_templates/search_livedoc_content and must NOT be guessed. Ask the user for these values " +
-        "(they come from DocCenter) if they were not already provided. " +
+        "profile/location this generation is being published against. Do NOT guess them: " +
+        "if search_livedoc_templates/search_livedoc_content already returned contentProfiles/profileVersionIds for " +
+        "the target content, use those; otherwise call find_doccenter_profile with the profile name to resolve " +
+        "profileId/profileVersionId. `contentLocation` has no lookup — ask the user for it if not already provided. " +
         "Returns a generationId — call get_ucb_workspace_generation_status to poll; the Workspace file is " +
         "committed automatically once the generation is Ready.",
       inputSchema: {
@@ -76,9 +99,9 @@ export function registerUcbWorkspaceTools(server: McpServer): void {
           format: z.string().describe("File format, e.g. \"PPTX\" or \"DOCX\" — must match outputs[0].format."),
         }).describe("Where in Workspace the generated file should be created."),
         origin: z.object({
-          profileId: z.string().describe("DocCenter profile id this generation is published against. Must be supplied by the caller — not derivable from search results."),
-          profileVersionId: z.string().describe("DocCenter profile version id. Must be supplied by the caller."),
-          contentLocation: z.string().describe("DocCenter content location path. Must be supplied by the caller."),
+          profileId: z.string().describe("DocCenter profile id this generation is published against. Get it from search results' contentProfiles/profileVersionIds when present, or from find_doccenter_profile by profile name."),
+          profileVersionId: z.string().describe("DocCenter profile version id. Get it from search results' profileVersionIds when present, or from find_doccenter_profile."),
+          contentLocation: z.string().describe("DocCenter content location path. No lookup available — must be supplied by the caller."),
         }).describe("DocCenter origin metadata for this generation."),
       },
     },
@@ -126,7 +149,9 @@ export function registerUcbWorkspaceTools(server: McpServer): void {
         nextStep = `Generation succeeded but committing to Workspace failed: ${body.commitError}. ` +
           `NEXT: call get_ucb_workspace_generation_status again with generationId="${body.generationId}" to retry the commit.`;
       } else if (body.workspaceCommitted) {
-        nextStep = "Done. The generated file has been committed to Workspace.";
+        nextStep = body.workspaceUrl
+          ? `Done. The generated file has been committed to Workspace. Open it here: ${body.workspaceUrl}`
+          : "Done. The generated file has been committed to Workspace.";
       } else if (body.status === "Failure" || body.status === "Cancelled") {
         nextStep = `Generation ${body.status}. Stop polling.`;
       } else {

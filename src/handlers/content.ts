@@ -41,6 +41,8 @@ export async function handleSearchTemplates(args: {
       format: string;
       teamsite: string;
       modifiedDate: string;
+      contentProfiles?: string[];
+      profileVersionIds?: string[];
     }>;
   };
   return {
@@ -52,6 +54,12 @@ export async function handleSearchTemplates(args: {
       teamSiteId: d.teamsite,
       modifiedDate: d.modifiedDate,
       description: d.description,
+      // Only present when this content version is already published to one or more DocCenter
+      // profiles — when present, profileVersionIds[i] corresponds to contentProfiles[i] and can
+      // be used directly as submit_ucb_workspace_generation's origin.profileVersionId without a
+      // separate find_doccenter_profile lookup.
+      contentProfiles: d.contentProfiles,
+      profileVersionIds: d.profileVersionIds,
     })),
   };
 }
@@ -97,6 +105,8 @@ export async function handleSearchContent(args: {
       teamsite: string;
       modifiedDate: string;
       sourceBlobId?: string;
+      contentProfiles?: string[];
+      profileVersionIds?: string[];
     }>;
   };
   return {
@@ -108,6 +118,12 @@ export async function handleSearchContent(args: {
       contentVersionId: d.contentVersionId,
       sourceBlobId: d.sourceBlobId,
       modifiedDate: d.modifiedDate,
+      // Only present when this content version is already published to one or more DocCenter
+      // profiles — when present, profileVersionIds[i] corresponds to contentProfiles[i] and can
+      // be used directly as submit_ucb_workspace_generation's origin.profileVersionId without a
+      // separate find_doccenter_profile lookup.
+      contentProfiles: d.contentProfiles,
+      profileVersionIds: d.profileVersionIds,
     })),
   };
 }

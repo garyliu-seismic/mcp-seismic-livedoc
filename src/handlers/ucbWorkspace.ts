@@ -1,4 +1,19 @@
 import { apiFetch } from "../api/client.js";
+import { getToken } from "../auth/state.js";
+import { jwtTenantFqdn } from "../auth/jwt.js";
+
+// LDS's own APIs never return a browsable URL for a committed file, so this is built client-side
+// from fileId + the JWT's tenant_fqdn. `viewType` is NOT format-dependent (there is no per-format
+// value — confirmed against workspace-service's ItemLocation enum, which only has SharedWithMe,
+// MyFiles, TeamFolder, DraftPresentations: c:\project_new\workspace-service\src\Seismic.Workspace.Model\Location\ItemLocation.cs).
+// It reflects the item's actual location context, determined server-side by
+// GET /api/workspace/v2/tenants/{tenantId}/items/{itemId}/location — an internal workspace-service
+// endpoint LDS does not currently proxy. "DraftPresentations" is the one value confirmed to work
+// end-to-end against a live QA tenant; treat it as a default, not a guaranteed-correct value for
+// every destination folder.
+function buildWorkspaceUrl(tenantFqdn: string, fileId: string): string {
+  return `https://${tenantFqdn}/apps/workspace/doc/${fileId}//grid/title?viewType=DraftPresentations`;
+}
 
 // Keyed by generationId. Populated by submitUcbWorkspaceGeneration, consumed by
 // getUcbWorkspaceGenerationStatus once the generation reaches "Ready" so the Workspace
@@ -174,6 +189,7 @@ export async function getUcbWorkspaceGenerationStatus(args: { generationId: stri
   }
   if (pending.committed) {
     response.workspaceCommitted = true;
+    response.workspaceUrl = buildWorkspaceUrlForPending(pending);
     return response;
   }
 
@@ -187,5 +203,12 @@ export async function getUcbWorkspaceGenerationStatus(args: { generationId: stri
     };
   }
   response.workspaceCommitted = true;
+  response.workspaceUrl = buildWorkspaceUrlForPending(pending);
   return response;
+}
+
+function buildWorkspaceUrlForPending(pending: PendingCommit): string | null {
+  const tenantFqdn = jwtTenantFqdn(getToken());
+  if (!tenantFqdn) return null;
+  return buildWorkspaceUrl(tenantFqdn, pending.fileId);
 }

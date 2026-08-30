@@ -10,9 +10,10 @@ const REQUEST_TIMEOUT_MS = 30_000;
 export async function apiFetch(
   path: string,
   options: RequestInit = {},
-  _retry = true
+  _retry = true,
+  base: string = BASE_URL
 ): Promise<{ status: number; body: unknown }> {
-  const url = `${BASE_URL}${path}`;
+  const url = `${base}${path}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let res: Response;
@@ -39,12 +40,12 @@ export async function apiFetch(
     if (savedToken && savedToken !== getToken()) {
       setToken(savedToken);
       dbg(`apiFetch: picked up saved token after ${res.status}, retrying`);
-      return apiFetch(path, options, false);
+      return apiFetch(path, options, false, base);
     }
     const hasCreds = !!(getCachedUsername() || DEFAULT_USERNAME) && !!(getCachedPassword() || DEFAULT_PASSWORD);
     if (hasCreds) {
       const refreshed = await autoLogin();
-      if (refreshed) return apiFetch(path, options, false);
+      if (refreshed) return apiFetch(path, options, false, base);
     }
   }
   if (res.status === 401 || res.status === 403) {

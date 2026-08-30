@@ -33,6 +33,25 @@ export const COWORK_PATH = process.env.CLAUDE_COWORK_PATH || findCoworkPath();
 
 export const BASE_URL = process.env.SEISMIC_BASE_URL ?? "https://api.seismic.com/livedoc";
 
+// The Integration API is a sibling service of the LiveDoc API, used to resolve a DocCenter
+// profile's id/versionId from its name (Document Generator's Public API has no such lookup).
+// Its gateway route is NOT a simple sibling path of LiveDoc's — per
+// api-specifications/packages/apim-route/public-api-mapping-{prod,non-prod}.yml:
+//   prod:            LiveDoc "/livedoc"        Integration "/integration"
+//   dev/qa/uat:       LiveDoc "/{env}/livedoc"  Integration "/{env}/services/integration"
+// (non-prod inserts an extra "services/" segment that prod does not have), so this must be
+// derived per-environment rather than by string-editing BASE_URL's trailing segment.
+function deriveIntegrationBaseUrl(baseUrl: string): string {
+  const url = new URL(baseUrl);
+  const nonProdMatch = url.pathname.match(/^\/(dev|qa|uat)\/livedoc\/?$/);
+  if (nonProdMatch) {
+    return `${url.origin}/${nonProdMatch[1]}/services/integration`;
+  }
+  return `${url.origin}/integration`;
+}
+
+export const INTEGRATION_BASE_URL = process.env.SEISMIC_INTEGRATION_BASE_URL ?? deriveIntegrationBaseUrl(BASE_URL);
+
 export const DEFAULT_AUTH_URI    = process.env.AUTH_SERVICE_URI ?? "https://auth-qa.seismic-dev.com";
 export const DEFAULT_AUTH_TENANT = process.env.AUTH_TENANT      ?? "";
 export const DEFAULT_USERNAME    = process.env.AUTH_USERNAME    ?? "";

@@ -234,6 +234,14 @@ Add the following to your `claude_desktop_config.json` (typically `%APPDATA%\Cla
 | `get_generation_download_url` | Get a signed download URL for a completed job |
 | `download_generation_output` | Download the generated file to the local machine |
 
+### UCB Workspace Generation
+| Tool | Description |
+|---|---|
+| `list_workspace_spaces` | List the Workspace spaces the current user can see |
+| `list_workspace_folders` | List root folders in a space, or items in a specific folder |
+| `submit_ucb_workspace_generation` | Submit a generation whose output is written directly into a Workspace folder |
+| `get_ucb_workspace_generation_status` | Poll generation status; auto-commits the file to Workspace once Ready |
+
 ### Panel (App UI)
 | Tool | Description |
 |---|---|
@@ -268,7 +276,7 @@ src/
   types.ts          # Shared TypeScript types
   api/              # Seismic API client (apiFetch)
   auth/             # Token state, auto-login, JWT utilities
-  handlers/         # Business logic (content, generation, inputs, panel)
+  handlers/         # Business logic (content, generation, inputs, panel, ucbWorkspace)
   ipc/              # Temp-file IPC between the server and the React panel
   tools/            # MCP tool registrations
   utils/            # Debug logging, OS utilities

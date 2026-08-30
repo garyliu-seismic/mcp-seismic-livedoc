@@ -1,0 +1,191 @@
+import { apiFetch } from "../api/client.js";
+
+// Keyed by generationId. Populated by submitUcbWorkspaceGeneration, consumed by
+// getUcbWorkspaceGenerationStatus once the generation reaches "Ready" so the Workspace
+// commit call can run without the model having to carry all these ids across turns.
+// In-memory only: if the server restarts mid-flow the pending commit is lost and the
+// generation must be resubmitted (generations are short-lived, so this is an acceptable trade-off).
+interface PendingCommit {
+  spaceId: string;
+  fileId: string;
+  fileVersionId: string;
+  instanceId: string;
+  stageId: string;
+  stageRecordId: string;
+  committed: boolean;
+}
+
+const pendingCommits = new Map<string, PendingCommit>();
+
+export async function listWorkspaceSpaces() {
+  const result = await apiFetch("/v3/workspace/destinations/spaces");
+  if (result.status !== 200) {
+    return { error: `Listing Workspace spaces failed (HTTP ${result.status})`, detail: result.body };
+  }
+  return result.body;
+}
+
+export async function listWorkspaceFolders(args: {
+  spaceId: string;
+  folderId?: string;
+  offset?: number;
+  limit?: number;
+}) {
+  const offset = args.offset ?? 0;
+  const limit = args.limit ?? 100;
+  const path = args.folderId
+    ? `/v3/workspace/destinations/spaces/${encodeURIComponent(args.spaceId)}/folders/${encodeURIComponent(args.folderId)}/items?offset=${offset}&limit=${limit}`
+    : `/v3/workspace/destinations/spaces/${encodeURIComponent(args.spaceId)}/roots`;
+  const result = await apiFetch(path);
+  if (result.status !== 200) {
+    return { error: `Listing Workspace folder contents failed (HTTP ${result.status})`, detail: result.body };
+  }
+  return result.body;
+}
+
+export async function submitUcbWorkspaceGeneration(args: {
+  teamSiteId: string;
+  libraryContentVersionId: string;
+  adHocInputs: Array<{ name: string; value: unknown }>;
+  outputs: Array<{ format: string; name?: string; fileName?: string }>;
+  variableListData?: Array<{
+    variableListName: string;
+    variableInputs: Array<{ name: string; value: unknown }>;
+  }>;
+  regionalFormat?: string;
+  workspace: { spaceId: string; folderId: string; name: string; format: string };
+  origin: { profileId: string; profileVersionId: string; contentLocation: string };
+}) {
+  if (args.outputs.length !== 1) {
+    return {
+      error: "Exactly one output is required for a UCB Workspace generation.",
+      detail: `Got ${args.outputs.length} outputs.`,
+    };
+  }
+
+  const generationInput: Record<string, unknown> = {
+    adHocInputs: args.adHocInputs,
+    outputs: args.outputs,
+  };
+  if (args.variableListData) generationInput.variableListData = args.variableListData;
+  if (args.regionalFormat) generationInput.regionalFormat = args.regionalFormat;
+
+  const reqBody = {
+    generationInput,
+    workspace: {
+      spaceId: args.workspace.spaceId,
+      folderId: args.workspace.folderId,
+      name: args.workspace.name,
+      format: args.workspace.format,
+    },
+    origin: {
+      profileId: args.origin.profileId,
+      profileVersionId: args.origin.profileVersionId,
+      contentLocation: args.origin.contentLocation,
+    },
+  };
+
+  const result = await apiFetch(
+    `/v3/teamsites/${args.teamSiteId}/livedocVersions/${args.libraryContentVersionId}/ucb-workspace-generations`,
+    { method: "POST", body: JSON.stringify(reqBody) }
+  );
+  if (result.status !== 201 && result.status !== 200) {
+    return { error: `UCB Workspace generation submission failed (HTTP ${result.status})`, detail: result.body };
+  }
+
+  const body = result.body as Record<string, unknown>;
+  const generationId = String(body.id ?? body.Id ?? "");
+  const lifecycle = (body.lifecycle ?? body.Lifecycle ?? {}) as Record<string, unknown>;
+  const workspace = (body.workspace ?? body.Workspace ?? {}) as Record<string, unknown>;
+
+  const instanceId = String(lifecycle.instanceId ?? lifecycle.InstanceId ?? "");
+  const stageId = String(lifecycle.stageId ?? lifecycle.StageId ?? "");
+  const stageRecordId = String(lifecycle.stageRecordId ?? lifecycle.StageRecordId ?? "");
+  const fileId = String(workspace.fileId ?? workspace.FileId ?? "");
+  const fileVersionId = String(workspace.fileVersionId ?? workspace.FileVersionId ?? "");
+
+  if (generationId && instanceId && stageId && stageRecordId && fileId && fileVersionId) {
+    pendingCommits.set(generationId, {
+      spaceId: args.workspace.spaceId,
+      fileId,
+      fileVersionId,
+      instanceId,
+      stageId,
+      stageRecordId,
+      committed: false,
+    });
+  }
+
+  return {
+    generationId,
+    workspaceFileName: args.workspace.name,
+    rawBody: body,
+    message: "UCB Workspace generation submitted. Call get_ucb_workspace_generation_status to poll for completion.",
+  };
+}
+
+async function commitToWorkspace(generationId: string, pending: PendingCommit) {
+  const result = await apiFetch(
+    `/v3/workspace/spaces/${encodeURIComponent(pending.spaceId)}/files/${encodeURIComponent(pending.fileId)}/versions/${encodeURIComponent(pending.fileVersionId)}/livedoc/instance`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        id: pending.instanceId,
+        stage: { id: pending.stageId, recordId: pending.stageRecordId },
+        useCustomName: false,
+      }),
+    }
+  );
+  if (result.status !== 200 && result.status !== 202 && result.status !== 204) {
+    return { error: `Committing the generated file to Workspace failed (HTTP ${result.status})`, detail: result.body };
+  }
+  pending.committed = true;
+  return { committed: true };
+}
+
+export async function getUcbWorkspaceGenerationStatus(args: { generationId: string }) {
+  const result = await apiFetch(`/v3/ucb-workspace-generations/${args.generationId}/status`);
+  if (result.status !== 200) {
+    return { error: `Status check failed (HTTP ${result.status})`, detail: result.body };
+  }
+  const raw = result.body as Record<string, unknown>;
+  const status = String(raw.status ?? raw.Status ?? "");
+  const isCompleted = Boolean(raw.isCompleted ?? raw.IsCompleted);
+
+  const response: Record<string, unknown> = {
+    generationId: String(raw.id ?? raw.Id ?? args.generationId),
+    status,
+    isCompleted,
+    formRecordId: raw.formRecordId ?? raw.FormRecordId ?? null,
+    workspaceCommitted: false,
+  };
+
+  if (status !== "Ready") {
+    return response;
+  }
+
+  const pending = pendingCommits.get(args.generationId);
+  if (!pending) {
+    return {
+      ...response,
+      error: "Generation is Ready, but the Workspace commit context for this generationId was lost " +
+        "(likely an MCP server restart mid-flow). The generation must be resubmitted via submit_ucb_workspace_generation.",
+    };
+  }
+  if (pending.committed) {
+    response.workspaceCommitted = true;
+    return response;
+  }
+
+  const commitResult = await commitToWorkspace(args.generationId, pending);
+  if ("error" in commitResult) {
+    return {
+      ...response,
+      workspaceCommitted: false,
+      commitError: commitResult.error,
+      commitErrorDetail: commitResult.detail,
+    };
+  }
+  response.workspaceCommitted = true;
+  return response;
+}

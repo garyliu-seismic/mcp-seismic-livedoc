@@ -14,6 +14,7 @@ import { registerChatTools } from "./tools/chat-tools.js";
 import { registerPanelTools } from "./tools/panel-tools.js";
 import { registerDeprecatedTools } from "./tools/deprecated-tools.js";
 import { registerPptxAutotagTools } from "./tools/pptx-autotag.js";
+import { registerUcbWorkspaceTools } from "./tools/ucb-workspace-tools.js";
 
 const server = new McpServer({ name: "seismic-livedoc", version: "1.0.0" });
 
@@ -21,6 +22,7 @@ registerChatTools(server);
 registerPanelTools(server);
 registerDeprecatedTools(server);
 registerPptxAutotagTools(server);
+registerUcbWorkspaceTools(server);
 
 // Process signal handlers
 process.on("SIGTERM", () => process.exit(0));

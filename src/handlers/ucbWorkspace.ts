@@ -129,6 +129,15 @@ export async function submitUcbWorkspaceGeneration(args: {
       stageRecordId,
       committed: false,
     });
+  } else {
+    return {
+      generationId,
+      workspaceFileName: args.workspace.name,
+      rawBody: body,
+      warning: "Could not extract lifecycle/workspace ids (instanceId/stageId/stageRecordId/fileId/fileVersionId) " +
+        "from the submission response. Auto-commit to Workspace will not work for this generationId — " +
+        "get_ucb_workspace_generation_status will report the commit context as lost even without a server restart.",
+    };
   }
 
   return {

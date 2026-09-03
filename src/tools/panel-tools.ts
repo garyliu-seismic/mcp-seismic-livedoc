@@ -4,21 +4,22 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
-import { dbg, DEBUG_LOG } from "../utils/debug.js";
+import { dbg } from "../utils/debug.js";
 import { getToken, setToken, isTokenManual, setTokenManual } from "../auth/state.js";
 import { jwtExpiresAt } from "../auth/jwt.js";
 import { handleLogin, autoLogin } from "../auth/auto-login.js";
 import { apiFetch } from "../api/client.js";
 import { handleGetInputs, buildFormSchema } from "../handlers/inputs.js";
-import { statusName, handleSubmitGeneration, handleGetDownloadUrl } from "../handlers/generation.js";
+import { handleSubmitGeneration, handleGetDownloadUrl, summarizeGenerationStatus } from "../handlers/generation.js";
 import { generateToken, getDownloadsDir, openWithDefaultApp, uniqueFilePath } from "../utils/os-utils.js";
 import {
   pendingFormSchemas, pendingGenerations,
   readSchema, writeSchema, deleteSchemaFile,
-  writeLatestToken, writeResult, readResult, writeGid, readGid,
+  writeLatestToken, writeResult, readResult, writeGid, readGid, deleteGidFile,
   readPrefill, deletePrefillFile,
 } from "../ipc/temp-file.js";
 import { DEFAULT_AUTH_TENANT, DEFAULT_USERNAME, DEFAULT_PASSWORD, FORM_RESOURCE_URI } from "../config.js";
+import type { ResultFileData } from "../types.js";
 
 // Same non-expired-token check as apiFetch, but also tries a silent autoLogin() refresh
 // (cached credentials from a prior panel login, or AUTH_* env defaults) before giving up.
@@ -255,19 +256,32 @@ export function registerPanelTools(server: McpServer): void {
       try { parsed = JSON.parse(payload); } catch {
         return { content: [{ type: "text" as const, text: "error: invalid JSON" }], structuredContent: { error: "Invalid payload JSON" } };
       }
+      const adHocInputs = (parsed.adHocInputs as Array<{ name: string; value: unknown }>) ?? [];
+      const variableListData = parsed.variableListData;
+      const manualSelectContentInput = parsed.manualSelectContentInput;
       const result = await handleSubmitGeneration({
         teamSiteId: schema.teamSiteId,
         libraryContentVersionId: schema.libraryContentVersionId,
-        adHocInputs: (parsed.adHocInputs as Array<{ name: string; value: unknown }>) ?? [],
+        adHocInputs,
         outputs: (parsed.outputs as Array<{ format: string; fileName?: string }>) ?? [],
-        variableListData: parsed.variableListData as never,
-        manualSelectContentInput: parsed.manualSelectContentInput as never,
+        variableListData: variableListData as never,
+        manualSelectContentInput: manualSelectContentInput as never,
       });
       // Write to temp files so get_panel_result (chat) can pick up the generatedLivedocId
       const gid = (result as Record<string, unknown>).generatedLivedocId as string | undefined;
       if (gid) {
         pendingGenerations.set(gid, token);
-        writeResult(token, { generatedLivedocId: gid, status: "Generating", downloadUrls: [], templateName: schema?.templateName ?? "" });
+        // submittedInputs preserves what the user actually typed/edited before hitting Submit —
+        // NOT necessarily what prefill_livedoc_form_values suggested — so a later tool call
+        // (e.g. submit_ucb_workspace_generation) can reuse the real values instead of the model
+        // guessing from its own earlier prefill suggestion.
+        writeResult(token, {
+          generatedLivedocId: gid,
+          status: "Generating",
+          downloadUrls: [],
+          templateName: schema?.templateName ?? "",
+          submittedInputs: { adHocInputs, variableListData, manualSelectContentInput },
+        });
         // Reverse-lookup file survives server restarts
         writeGid(gid, token);
       }
@@ -288,39 +302,26 @@ export function registerPanelTools(server: McpServer): void {
     async (args) => {
       const { generatedLivedocId } = args as { generatedLivedocId: string };
       const res = await apiFetch(`/v3/generatedLivedocs/${generatedLivedocId}`);
-      const dbg = (msg: string) => fs.appendFileSync(
-        path.join(os.tmpdir(), "mcp-livedoc-debug.log"),
-        `[${new Date().toISOString()}] POLL: ${msg}\n`
-      );
       if (res.status !== 200) {
-        dbg(`HTTP ${res.status} for ${generatedLivedocId}`);
+        dbg(`POLL: HTTP ${res.status} for ${generatedLivedocId}`);
         return { content: [{ type: "text" as const, text: "error" }], structuredContent: { status: "Failed", error: `HTTP ${res.status}` } };
       }
-      const body = res.body as Record<string, unknown>;
-      const topStatus = statusName(body.status ?? body.Status);
-      const outputs = ((body.outputs ?? body.Outputs) as Array<Record<string, unknown>>) ?? [];
-      const outputStatuses = outputs.map(o => statusName(o.status ?? o.Status));
-      const allDone = outputs.length > 0 && outputStatuses.every(s => s === "Completed" || s === "Failed");
-      dbg(`id=${generatedLivedocId} topStatus=${topStatus} outputs=${JSON.stringify(outputStatuses)}`);
-      dbg(`rawOutputs=${JSON.stringify(outputs)}`);
-
-      // Consider done when ALL outputs have individually completed (top-level status can lag)
-      const status = allDone
-        ? (outputStatuses.some(s => s === "Failed") ? "Failed" : "Completed")
-        : (topStatus === "Failed" ? "Failed" : "Generating");
+      // Shared with the headless chat flow (handleGetStatus) so the two flows can never
+      // disagree on whether a generation is done — see summarizeGenerationStatus.
+      const summary = summarizeGenerationStatus(res.body as Record<string, unknown>);
+      dbg(`POLL: id=${generatedLivedocId} topStatus=${summary.topStatus} overallStatus=${summary.overallStatus} outputs=${JSON.stringify(summary.outputs.map(o => o.status))}`);
 
       const downloadUrls: string[] = [];
       const downloads: Array<{ url: string; format: string; fileName: string }> = [];
-      if (status === "Completed") {
-        await Promise.all(outputs.map(async (o) => {
-          const outputId = String(o.id ?? o.Id ?? "");
-          const format  = String(o.format ?? o.Format ?? "pptx").toLowerCase();
-          if (format === "thumbnail") return;  // thumbnail outputs don't have downloadable content
-          const rawName = String(o.fileName ?? o.FileName ?? `output`);
+      if (summary.overallStatus === "Completed") {
+        await Promise.all(summary.outputs.map(async (o) => {
+          const outputId = o.id;
+          const format = (o.format ?? "pptx").toLowerCase();
+          const rawName = o.fileName || "output";
           const fileName = path.extname(rawName) ? rawName : `${rawName}.${format}`;
           if (!outputId) return;
           const dlResult = await handleGetDownloadUrl({ generatedLivedocId, outputId });
-          dbg(`dl outputId=${outputId} result=${JSON.stringify(dlResult)}`);
+          dbg(`POLL: dl outputId=${outputId} result=${JSON.stringify(dlResult)}`);
           const dlBody = dlResult as Record<string, unknown>;
           const url = String(dlBody.url ?? dlBody.downloadUrl ?? dlBody.Url ?? dlBody.DownloadUrl ?? "");
           if (url) { downloadUrls.push(url); downloads.push({ url, format, fileName }); }
@@ -333,22 +334,30 @@ export function registerPanelTools(server: McpServer): void {
           if (gidData) formToken = gidData.formToken;
         }
         if (formToken) {
-          // Preserve templateName written by submit_form
+          // Preserve templateName + submittedInputs written by submit_form -- this write
+          // replaces the whole result object, so anything not re-passed here is lost.
           let templateName = "";
+          let submittedInputs: ResultFileData["submittedInputs"];
           const existingResult = readResult(formToken);
-          if (existingResult) templateName = existingResult.templateName ?? "";
-          writeResult(formToken, { generatedLivedocId, status: "Completed", downloadUrls, downloads, templateName });
+          if (existingResult) {
+            templateName = existingResult.templateName ?? "";
+            submittedInputs = existingResult.submittedInputs;
+          }
+          writeResult(formToken, { generatedLivedocId, status: "Completed", downloadUrls, downloads, templateName, submittedInputs });
         }
+        // gid → formToken mapping is only needed until the terminal write above; drop it
+        // now so %TEMP% doesn't accumulate a file per generation indefinitely.
+        deleteGidFile(generatedLivedocId);
       }
       return {
-        content: [{ type: "text" as const, text: status }],
+        content: [{ type: "text" as const, text: summary.overallStatus }],
         structuredContent: {
-          status, downloadUrls, downloads,
+          status: summary.overallStatus, downloadUrls, downloads,
           // Include per-output detail so the panel can show a meaningful failure reason
-          outputs: outputs.map(o => ({
-            format: String(o.format ?? o.Format ?? ""),
-            status: statusName(o.status ?? o.Status),
-            errorMessage: String(o.errorMessage ?? o.ErrorMessage ?? o.error ?? o.Error ?? ""),
+          outputs: summary.outputs.map(o => ({
+            format: o.format ?? "",
+            status: o.status,
+            errorMessage: o.errorString ?? "",
           })),
         },
       };
@@ -399,11 +408,10 @@ export function registerPanelTools(server: McpServer): void {
     },
     async (args) => {
       const { generatedLivedocId, outputId } = args as { generatedLivedocId: string; outputId: string };
-      const LOG = (msg: string) => { try { fs.appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] PREV: ${msg}\n`); } catch {} };
-      LOG(`gid=${generatedLivedocId} outputId=${outputId}`);
+      dbg(`PREV: gid=${generatedLivedocId} outputId=${outputId}`);
       const res = await apiFetch(`/v3/generatedLivedocs/${generatedLivedocId}/outputs/${outputId}/previewImages`);
       const bodySnip = JSON.stringify(res.body).slice(0, 400);
-      LOG(`HTTP ${res.status} body=${bodySnip}`);
+      dbg(`PREV: HTTP ${res.status} body=${bodySnip}`);
       if (res.status !== 200) {
         return {
           content: [{ type: "text" as const, text: `Preview images unavailable: HTTP ${res.status}` }],
@@ -424,7 +432,7 @@ export function registerPanelTools(server: McpServer): void {
           return host.endsWith(".seismic.com") || host.endsWith(".seismic-dev.com");
         } catch { return false; }
       });
-      LOG(`${images.length} images; url[0]=${images[0]?.url?.slice(0,80) ?? "none"}`);
+      dbg(`PREV: ${images.length} images; url[0]=${images[0]?.url?.slice(0,80) ?? "none"}`);
       return {
         content: [{ type: "text" as const, text: `${images.length} preview images` }],
         structuredContent: { images },

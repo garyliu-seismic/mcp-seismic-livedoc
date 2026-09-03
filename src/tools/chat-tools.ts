@@ -10,6 +10,7 @@ import { handleGetFormDefinition } from "../handlers/formDefinition.js";
 import { handleSubmitGeneration, handleGetStatus, handleGetDownloadUrl, handleDownloadGenerationOutput } from "../handlers/generation.js";
 import { generateToken } from "../utils/os-utils.js";
 import { writeSchema, writeLatestToken, readResult, writePrefill, readSchema } from "../ipc/temp-file.js";
+import { validatePrefillFieldNames } from "../handlers/prefillValidation.js";
 import { FORM_RESOURCE_URI } from "../config.js";
 
 export function registerChatTools(server: McpServer): void {
@@ -145,7 +146,7 @@ export function registerChatTools(server: McpServer): void {
           type: "text" as const,
           text: `Form opened in the App panel (formToken="${formToken}"). ` +
             `The user fills it out and clicks Submit in the panel — generation runs automatically. ` +
-            `DO NOT call open_form_ui. DO NOT call submit_form. DO NOT call get_form_result. ` +
+            `DO NOT call submit_form. ` +
             `Just tell the user to fill the form. When they say it is done, call get_panel_result with formToken="${formToken}". ` +
             `If sample/default values were requested, call prefill_livedoc_form_values with formToken="${formToken}" — ` +
             `use ONLY the exact field/table/variable-list names listed below, never invent your own: ` +
@@ -196,21 +197,16 @@ export function registerChatTools(server: McpServer): void {
         };
       }
 
-      const validScalars = new Set((schema.adhocScalars ?? []).map(f => f.name));
-      const validTables = new Set((schema.adhocTables ?? []).map(t => t.name));
-      const validVLs = new Set((schema.variableLists ?? []).map(vl => vl.name));
-      const unknown: string[] = [];
-      Object.keys(scalars ?? {}).forEach(k => { if (!validScalars.has(k)) unknown.push(`scalars.${k}`); });
-      Object.keys(tables ?? {}).forEach(k => { if (!validTables.has(k)) unknown.push(`tables.${k}`); });
-      Object.keys(variableLists ?? {}).forEach(k => { if (!validVLs.has(k)) unknown.push(`variableLists.${k}`); });
+      const { unknown, validScalars, validTables, validVariableLists } =
+        validatePrefillFieldNames(schema, { scalars, tables, variableLists });
       if (unknown.length > 0) {
         return {
           content: [{
             type: "text" as const,
             text: `error: unknown field name(s): ${unknown.join(", ")}. ` +
-              `Valid names — scalars: ${[...validScalars].join(", ") || "(none)"}; ` +
-              `tables: ${[...validTables].join(", ") || "(none)"}; ` +
-              `variableLists: ${[...validVLs].join(", ") || "(none)"}. ` +
+              `Valid names — scalars: ${validScalars.join(", ") || "(none)"}; ` +
+              `tables: ${validTables.join(", ") || "(none)"}; ` +
+              `variableLists: ${validVariableLists.join(", ") || "(none)"}. ` +
               `Re-call prefill_livedoc_form_values using only these exact names.`,
           }],
           structuredContent: { error: "Unknown field name(s)", unknown },
@@ -234,7 +230,12 @@ export function registerChatTools(server: McpServer): void {
     {
       description:
         "Get the result of the LiveDoc generation triggered from the App panel. " +
-        "Call this after the user says generation is done. Returns generatedLivedocId, status, downloads array, and templateName. " +
+        "Call this after the user says generation is done. Returns generatedLivedocId, status, downloads array, templateName, " +
+        "and submittedInputs (the adHocInputs/variableListData/manualSelectContentInput the user actually submitted in the panel — " +
+        "NOT necessarily what prefill_livedoc_form_values suggested, since the user can edit before hitting Submit). " +
+        "If the user then asks to also save this same generation to Seismic Workspace, reuse submittedInputs.adHocInputs/" +
+        "variableListData verbatim as submit_ucb_workspace_generation's adHocInputs/variableListData — do NOT re-derive or " +
+        "guess those values from earlier turns. " +
         "IMPORTANT — when status is 'Completed': " +
         "(1) Create an HTML artifact (type='text/html') showing a generation-complete card. " +
         "The card must include: a green check icon, 'Generation complete' heading, templateName, 'Completed' badge, " +
@@ -254,11 +255,14 @@ export function registerChatTools(server: McpServer): void {
           content: [{ type: "text" as const, text: "No result yet — generation has not started or the form has not been submitted. Check the App panel." }],
         };
       }
+      const submittedInputsNote = data.submittedInputs
+        ? ` submittedInputs (reuse verbatim for submit_ucb_workspace_generation if the user wants this also saved to Workspace): ${JSON.stringify(data.submittedInputs)}.`
+        : "";
       const text = data.status === "Completed"
         ? `Generation complete. templateName: "${data.templateName ?? ""}". generatedLivedocId: ${data.generatedLivedocId}. ` +
-          `downloads: ${JSON.stringify(data.downloads ?? [])}. ` +
+          `downloads: ${JSON.stringify(data.downloads ?? [])}.${submittedInputsNote} ` +
           `Create an HTML artifact showing the result card, then call download_generation_output for each output.`
-        : `Generation status: ${data.status}. generatedLivedocId: ${data.generatedLivedocId}. Check back shortly.`;
+        : `Generation status: ${data.status}. generatedLivedocId: ${data.generatedLivedocId}.${submittedInputsNote} Check back shortly.`;
       return {
         content: [{ type: "text" as const, text }],
         structuredContent: data as unknown as Record<string, unknown>,

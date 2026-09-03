@@ -52,6 +52,18 @@ function deriveIntegrationBaseUrl(baseUrl: string): string {
 
 export const INTEGRATION_BASE_URL = process.env.SEISMIC_INTEGRATION_BASE_URL ?? deriveIntegrationBaseUrl(BASE_URL);
 
+// The workspace-browsing endpoints (GetWorkspaceDestinationSpaces/Roots/RootItems/FolderItems) live
+// in a separate "Document Generator (Internal)" API resource — added 2026-09-03 with its own api_id
+// so it can't collide with the main LiveDoc api_id (see api-specifications commit 06dc51c1). Unlike
+// the Integration API, this one IS a simple sibling path: LiveDoc "/{env}/livedoc" (prod: "/livedoc")
+// -> Internal "/{env}/livedoc-internal" (prod: "/livedoc-internal"), no extra segment inserted.
+function deriveInternalBaseUrl(baseUrl: string): string {
+  const url = new URL(baseUrl);
+  return `${url.origin}${url.pathname.replace(/\/livedoc\/?$/, "/livedoc-internal")}`;
+}
+
+export const INTERNAL_BASE_URL = process.env.SEISMIC_INTERNAL_BASE_URL ?? deriveInternalBaseUrl(BASE_URL);
+
 export const DEFAULT_AUTH_URI    = process.env.AUTH_SERVICE_URI ?? "https://auth-qa.seismic-dev.com";
 export const DEFAULT_AUTH_TENANT = process.env.AUTH_TENANT      ?? "";
 export const DEFAULT_USERNAME    = process.env.AUTH_USERNAME    ?? "";
@@ -63,6 +75,5 @@ export const BROWSER_SCOPES    = "openid id library download engagement_read eng
   "feature_read collection_read contentdiscovery doccenter_backend_read livedoc " +
   "ums_bff_read das_data_rw email profile entitlement_read aiml_llm";
 
-export const FORM_APP_BASE = process.env.FORM_APP_URL ?? "http://localhost:5173";
 export const FORM_API_BASE = process.env.FORM_API_URL ?? "http://localhost:3001";
 export const FORM_RESOURCE_URI = "ui://livedoc/form";

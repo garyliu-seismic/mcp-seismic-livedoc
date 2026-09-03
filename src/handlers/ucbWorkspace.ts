@@ -1,6 +1,7 @@
 import { apiFetch } from "../api/client.js";
 import { getToken } from "../auth/state.js";
 import { jwtTenantFqdn } from "../auth/jwt.js";
+import { INTERNAL_BASE_URL } from "../config.js";
 
 // LDS's own APIs never return a browsable URL for a committed file, so this is built client-side
 // from fileId + the JWT's tenant_fqdn. `viewType` is NOT format-dependent (there is no per-format
@@ -32,8 +33,10 @@ interface PendingCommit {
 
 const pendingCommits = new Map<string, PendingCommit>();
 
+// GetWorkspaceDestinationSpaces/Roots/FolderItems live in the "Document Generator (Internal)"
+// API resource, not the main LiveDoc one — must use INTERNAL_BASE_URL. See config.ts.
 export async function listWorkspaceSpaces() {
-  const result = await apiFetch("/v3/workspace/destinations/spaces");
+  const result = await apiFetch("/v3/workspace/destinations/spaces", {}, true, INTERNAL_BASE_URL);
   if (result.status !== 200) {
     return { error: `Listing Workspace spaces failed (HTTP ${result.status})`, detail: result.body };
   }
@@ -51,7 +54,7 @@ export async function listWorkspaceFolders(args: {
   const path = args.folderId
     ? `/v3/workspace/destinations/spaces/${encodeURIComponent(args.spaceId)}/folders/${encodeURIComponent(args.folderId)}/items?offset=${offset}&limit=${limit}`
     : `/v3/workspace/destinations/spaces/${encodeURIComponent(args.spaceId)}/roots`;
-  const result = await apiFetch(path);
+  const result = await apiFetch(path, {}, true, INTERNAL_BASE_URL);
   if (result.status !== 200) {
     return { error: `Listing Workspace folder contents failed (HTTP ${result.status})`, detail: result.body };
   }

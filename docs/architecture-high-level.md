@@ -373,7 +373,7 @@ flowchart LR
     PDF["PDF / external content"]:::l
     CLI["Claude agent"]:::l
 
-    A2_ -. drives client-side authoring of the live PPTX . --> M
+    A2_ -.->|drives client-side authoring of the live PPTX| M
     M -->|"POST generation (inputs + outputs)"| A
     M -->|"definition / attach / values"| D
     A -->|"spawn build jobs"| C

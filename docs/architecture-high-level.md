@@ -229,7 +229,6 @@ panel mid-generation can resume (readSchema on the token + an `existingResult`) 
 
 ```mermaid
 sequenceDiagram
-    autoname
     participant CP as Claude MCP client
     participant S as MCP server
     participant B as Browser
@@ -246,7 +245,6 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    autoname
     participant CP as Claude MCP client
     participant S as MCP server
     participant B as Browser
@@ -254,9 +252,9 @@ sequenceDiagram
 
     Note over S,U: browserLogin(tenant, username, password)
     S->>B: 1) GET /tenants/{tenant}/connect/authorize?response_mode=form_post (redirect:manual)
-    B-->>S: 302; cookies for the session (NOT the form redirect)
+    B-->>S: 302, cookies for the session (NOT the form redirect)
     S->>B: 2) POST /tenants/{tenant}/api/v1/account/login {Username, Password …} (Cookie)
-    B-->>S: 200 {isSuccess:true}; merge/refresh session cookies
+    B-->>S: 200 {isSuccess:true}, merge/refresh session cookies
     S->>B: 3) GET /connect/authorize/callback?response_mode=form_post (Cookie form POST)
     B-->>S: form containing access_token
     S-->>S: setToken + setTokenManual(false) + saveToken + cache credentials + log jwtExpiresAt
@@ -279,18 +277,18 @@ Key auth behaviours:
 flowchart LR
     ENV["environment variables"] --> C["src/config.ts"]
     SEISMIC["SEISMIC_BASE_URL<br/>https://api.seismic.com/qa/livedoc"]
-    AUTH=["AUTH_TENANT / AUTH_USERNAME / AUTH_PASSWORD / AUTH_SERVICE_URI / AUTH_CLIENT_ID / FORM_API_URL"]
+    AUTH["AUTH_TENANT / AUTH_USERNAME / AUTH_PASSWORD / AUTH_SERVICE_URI / AUTH_CLIENT_ID / FORM_API_URL"]
     C -->|derive| LB["LIVE_DOC_BASE_URL / INTEGRATION_BASE_URL / INTERNAL_BASE_URL / AUTH_BASE_URL / FORM_BASE_URL"]
 
     SEISMIC --> C
     AUTH --> C
     LB --> API[apiFetch]
 
-    API --|prod| A["/livedoc<br/>/integration"]
-    API --|non-prod| N["/{env}/livedoc<br/>/integration]
-    C --|internal API| "/livedoc-internal<br/>({env}/livedoc-internal]
-    C --|auth service| /{tenant}/connect|...]
-    C --|form API| {FORM_BAS_URL} (dev) OR /3/* (prod)
+    API -->|prod| A["/livedoc<br/>/integration"]
+    API -->|non-prod| N["/{env}/livedoc<br/>/integration"]
+    C -->|internal API| I["/livedoc-internal<br/>/{env}/livedoc-internal"]
+    C -->|auth service| AS["/{tenant}/connect"]
+    C -->|form API| FORM["FORM_API_URL (dev) or /3/* (prod)"]
 ```
 
 ```
@@ -320,12 +318,11 @@ bundled with `@modelcontextprotocol/ext-apps` into one HTML page served as an MC
 ```mermaid
 flowchart TD
     FS["form-shell.html"] --> FSA["FormShell.jsx (createRoot)"]
-    FSA -->{"load state"}
-    FSA --> FC["FormApp.jsx (the wizard)"]
-    FC -->{"useAppConnection"} AC["App↔server bridge<br/>callServerTool/ontoolresult"]
-    FC -->{"useFormState"} FS2["scalar/table/variable-list state"]
-    FC -->{"useGenerationPoll"} GP["poll_interval<br/>3s; MAX=4min"]
-    FC -->{"Submit"} SF["Submit (→ call_server_tool submit_form)"]
+    FSA -->|load state| FC["FormApp.jsx (the wizard)"]
+    FC -->|useAppConnection| AC["App↔server bridge<br/>callServerTool/ontoolresult"]
+    FC -->|useFormState| FS2["scalar/table/variable-list state"]
+    FC -->|useGenerationPoll| GP["poll_interval<br/>3s; MAX=4min"]
+    FC -->|Submit| SF["Submit (→ call_server_tool submit_form)"]
 
     SF --> SU["callServerTool:submit_form"]
     SU --> SP["callServerTool:poll_generation<br/>…until Completed → save result"]

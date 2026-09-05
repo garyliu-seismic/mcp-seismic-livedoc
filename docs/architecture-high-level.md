@@ -109,7 +109,7 @@ flowchart TD
     U -->|Integration API| PR["handlers/profile.ts<br/>(find_doccenter_profile)"]
     U -->|"Internal API"| UC["handlers/ucbWorkspace.ts<br/>(list spaces/folders/status)"]
 
-    A -->|fetch() over stdio| POC["external PoC server<br/>(pptx extract/auto-tag/mark)"]
+    A -->|"fetch() over stdio"| POC["external PoC server<br/>(pptx extract/auto-tag/mark)"]
 ```
 
 ### 3b. Tool catalogue
@@ -157,7 +157,7 @@ flowchart LR
     API4 -->|201/200 generatedLivedocId| G3["summarizeGenerationStatus"]
     G3 -->|still running| G4["GET /v3/generatedLivedocs/{id} (poll)"]
     G4 -->|all outputs done| G5["GET .../outputs/{id}/content?redirect=false → downloadUrl"]
-    G5 --> G6[download_to_file() → save/optional open]
+    G5 --> G6["download_to_file() → save/optional open"]
     G3 -->|failed| G4
 ```
 
@@ -191,9 +191,9 @@ persisting small JSON blobs as **temp files** with a unique token id.
 ```mermaid
 flowchart LR
     SERVER["Node MCP server<br/>process A"] <-->|over stdio MCP<br/>app.callServerTool| PANEL["React panel<br/>process B"]
-    SERVER -->|"writeSchema/writeLatestToken/<br/>writePrefill/writeGid/writeResult<br/>saveToken| "
+    SERVER -->|"writeSchema/writeLatestToken/<br/>writePrefill/writeGid/writeResult<br/>saveToken"| T1
 
-    subgraph Temp["%TEMP% (os.tmpdir())"]
+    subgraph Temp
         T1["mcp-livedoc-schema-{token}.json<br/>form schema; server→panel"]
         T2["mcp-livedoc-latest-token.json<br/>latest formToken pointer; panel polls"]
         T3["mcp-livedoc-result-{token}.json<br/>generation result; panel→Claude"]
@@ -201,9 +201,7 @@ flowchart LR
         T5["mcp-livedoc-token.json<br/>bearer token; survives restarts"]
         T6["mcp-livedoc-crash.log<br/>uncaught/unhandledRejection entries"]
     end
-    PANEL -->|"readSchema/readLatestToken/<br/>readResult/readPrefill/readGid<br/>callServerTool"
-
-    TEMP["TEMP (fs)"]
+    PANEL -->|"readSchema/readLatestToken/<br/>readResult/readPrefill/readGid<br/>callServerTool"| T2
 ```
 
 | File | Written by | Read by | Contents |

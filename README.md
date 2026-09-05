@@ -125,6 +125,18 @@ When `get_panel_result` returns `status: "Completed"`, Claude should:
 | Panel shows the login screen | User fills tenant/username/password in the panel; the saved token is picked up by the server on the next tool call without any restart |
 | `SEISMIC_API_TOKEN` set in env | Token is used as-is; auto-login is skipped; use `set_token` to rotate it |
 
+### Common tool errors
+
+These are the errors tools actually return for invalid input — recognize them and react as described instead of retrying blindly or asking the user for internal IDs.
+
+| Tool | Trigger | Response shape |
+|---|---|---|
+| `prefill_livedoc_form_values` | Field/table/variable-list name not in the schema from `get_livedoc_inputs` | `isError: true`, text: `error: unknown field name(s): scalars.Bogus. Valid names — scalars: CompanyName, Amount; tables: LineItems; variableLists: Signers. Re-call prefill_livedoc_form_values using only these exact names.` — re-call using only the listed names, never guess a fix |
+| `prefill_livedoc_form_values` | `formToken` doesn't match an open form (panel was closed, or a stale/typo'd token) | `isError: true`, text: `error: no form open for this formToken (schema not found)` — tell the user to reopen the form via `get_livedoc_inputs`; do not retry the same token |
+| `get_panel_result` | Called before the user has submitted the form in the panel | Not an error — text: `No result yet — generation has not started or the form has not been submitted. Check the App panel.` — wait for the user to confirm, then call again |
+| `submit_livedoc_generation` / any authenticated call | Token missing or expired and auto-login fails | HTTP 401/403 surfaced in the tool response — do not ask for the password in chat; tell the user to sign in via the panel's login form |
+| `search_livedoc_templates` | No template matches the search text | Empty result list, not an error | Ask the user to refine the search text; don't fabricate a `teamSiteId`/`libraryContentVersionId` |
+
 ### What Claude should never do
 
 - Ask the user for `teamSiteId`, `libraryContentVersionId`, `contentVersionId`, or `generatedLivedocId` — always resolve these via tools.
@@ -162,6 +174,14 @@ npm run build:all
 npm run dev
 ```
 
+## Testing
+
+```bash
+npm test
+```
+
+Runs Node's built-in test runner (via `tsx`) over `src/**/*.test.ts`. Coverage today focuses on the temp-file IPC layer (`src/ipc/temp-file.ts`) and the `prefill_livedoc_form_values` field-name validation (`src/handlers/prefillValidation.ts`).
+
 ## Configuration
 
 The server is configured via environment variables:
@@ -169,7 +189,6 @@ The server is configured via environment variables:
 | Variable | Description |
 |---|---|
 | `SEISMIC_BASE_URL` | Base URL for the LiveDoc API |
-| `FORM_APP_URL` | URL of the form UI dev server (default: `http://localhost:5173`) |
 | `AUTH_SERVICE_URI` | Seismic auth service base URL |
 | `AUTH_TENANT` | Tenant slug used for auto-login |
 | `AUTH_CLIENT_ID` | OAuth client ID for auto-login |

@@ -1,11 +1,11 @@
 ﻿import * as fs from "fs";
 import * as path from "path";
-import * as os from "os";
 import { apiFetch } from "../api/client.js";
 import { authHeaders } from "../auth/headers.js";
 import { BASE_URL } from "../config.js";
 import { getDownloadsDir, openWithDefaultApp, uniqueFilePath } from "../utils/os-utils.js";
 import { needsContentResolution } from "./content.js";
+import { dbg } from "../utils/debug.js";
 
 // Matches LiveDocGenStatusResp in app-livedoc-service (PublicAPIV3Controller.ResultStatus.cs):
 // Queued=0, Generating=1, Completed=2, Failed=3. The API returns this as a number, not a string,
@@ -20,6 +20,51 @@ export function statusName(raw: unknown): string {
     return raw;
   }
   return String(raw);
+}
+
+export interface GenerationOutputSummary {
+  id: string;
+  status: string;
+  format: string;
+  name?: string;
+  fileName?: string;
+  errorString: string | null;
+}
+
+export interface GenerationStatusSummary {
+  generatedLivedocId: string;
+  /** Job-level status reported by the API, before any output-level reasoning. */
+  topStatus: string;
+  /** Non-thumbnail outputs only — thumbnail outputs have no downloadable content and must not affect completion. */
+  outputs: GenerationOutputSummary[];
+  allDone: boolean;
+  /** Single-value status derived from outputs (or topStatus as a fail-fast fallback while still generating). */
+  overallStatus: "Generating" | "Completed" | "Failed";
+}
+
+/**
+ * Single source of truth for "is this generation done, and did it succeed" — used by both the
+ * headless chat flow (handleGetStatus) and the App panel flow (poll_generation). Keeping this in
+ * one place avoids the two flows disagreeing on allDone when a thumbnail output stalls or fails.
+ */
+export function summarizeGenerationStatus(raw: Record<string, unknown>): GenerationStatusSummary {
+  const generatedLivedocId = (raw.id ?? raw.Id ?? raw.generatedLivedocId ?? raw.GeneratedLivedocId) as string;
+  const topStatus = statusName(raw.status ?? raw.Status);
+  const rawOutputs = ((raw.outputs ?? raw.Outputs ?? []) as Array<Record<string, unknown>>)
+    .filter((o) => String(o.format ?? o.Format ?? "").toLowerCase() !== "thumbnail");
+  const outputs: GenerationOutputSummary[] = rawOutputs.map((o) => ({
+    id: (o.id ?? o.Id) as string,
+    status: statusName(o.status ?? o.Status),
+    format: (o.format ?? o.Format) as string,
+    name: (o.name ?? o.Name) as string,
+    fileName: (o.fileName ?? o.FileName) as string,
+    errorString: (o.errorString ?? o.ErrorString ?? o.errorMessage ?? o.ErrorMessage ?? o.error ?? o.Error ?? null) as string | null,
+  }));
+  const allDone = outputs.length > 0 && outputs.every((o) => o.status === "Completed" || o.status === "Failed");
+  const overallStatus: GenerationStatusSummary["overallStatus"] = allDone
+    ? (outputs.some((o) => o.status === "Failed") ? "Failed" : "Completed")
+    : (topStatus === "Failed" ? "Failed" : "Generating");
+  return { generatedLivedocId, topStatus, outputs, allDone, overallStatus };
 }
 
 export async function handleSubmitGeneration(args: {
@@ -86,8 +131,7 @@ export async function handleSubmitGeneration(args: {
     ? `?liveFormSellerTemplateId=${encodeURIComponent(args.liveFormSellerTemplateId)}`
     : "";
 
-  // Debug dump — readable at %TEMP%\mcp-livedoc-debug-submit.json after each Submit
-  try { fs.writeFileSync(path.join(os.tmpdir(), "mcp-livedoc-debug-submit.json"), JSON.stringify(reqBody, null, 2)); } catch { /* ignore */ }
+  dbg(`SUBMIT: ${JSON.stringify(reqBody)}`);
 
   const result = await apiFetch(
     `/v3/teamsites/${args.teamSiteId}/livedocVersions/${args.libraryContentVersionId}${qp}`,
@@ -118,24 +162,12 @@ export async function handleGetStatus(args: { generatedLivedocId: string }) {
   if (result.status !== 200) {
     return { error: `Status check failed (HTTP ${result.status})`, detail: result.body };
   }
-  const raw = result.body as Record<string, unknown>;
-  const id = (raw.id ?? raw.Id ?? raw.generatedLivedocId ?? raw.GeneratedLivedocId) as string;
-  const rawOutputs = ((raw.outputs ?? raw.Outputs ?? []) as Array<Record<string, unknown>>)
-    .filter(o => String(o.format ?? o.Format ?? "").toLowerCase() !== "thumbnail");
-  const outputs = rawOutputs.map((o) => ({
-    id: (o.id ?? o.Id) as string,
-    status: statusName(o.status ?? o.Status),
-    format: (o.format ?? o.Format) as string,
-    name: (o.name ?? o.Name) as string,
-    fileName: (o.fileName ?? o.FileName) as string,
-    errorString: (o.errorString ?? o.ErrorString ?? null) as string | null,
-  }));
-  const allDone = outputs.every((o) => o.status === "Completed" || o.status === "Failed");
+  const summary = summarizeGenerationStatus(result.body as Record<string, unknown>);
   return {
-    generatedLivedocId: id,
-    allDone,
-    outputs,
-    hint: allDone
+    generatedLivedocId: summary.generatedLivedocId,
+    allDone: summary.allDone,
+    outputs: summary.outputs,
+    hint: summary.allDone
       ? "All outputs done. Call get_generation_download_url with each outputId."
       : "Still generating. Poll again in a few seconds.",
   };

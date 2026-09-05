@@ -12,7 +12,6 @@ import { autoLogin } from "./auth/auto-login.js";
 import { jwtExpiresAt } from "./auth/jwt.js";
 import { registerChatTools } from "./tools/chat-tools.js";
 import { registerPanelTools } from "./tools/panel-tools.js";
-import { registerDeprecatedTools } from "./tools/deprecated-tools.js";
 import { registerPptxAutotagTools } from "./tools/pptx-autotag.js";
 import { registerUcbWorkspaceTools } from "./tools/ucb-workspace-tools.js";
 
@@ -20,7 +19,6 @@ const server = new McpServer({ name: "seismic-livedoc", version: "1.0.0" });
 
 registerChatTools(server);
 registerPanelTools(server);
-registerDeprecatedTools(server);
 registerPptxAutotagTools(server);
 registerUcbWorkspaceTools(server);
 

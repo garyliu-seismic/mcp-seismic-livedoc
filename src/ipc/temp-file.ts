@@ -36,6 +36,14 @@ export function deleteSchemaFile(token: string): void {
   try { fs.unlinkSync(schemaPath(token)); } catch { /* ignore */ }
 }
 
+export function deleteResultFile(token: string): void {
+  try { fs.unlinkSync(resultPath(token)); } catch { /* ignore */ }
+}
+
+export function deleteGidFile(gid: string): void {
+  try { fs.unlinkSync(gidPath(gid)); } catch { /* ignore */ }
+}
+
 export function writeLatestToken(formToken: string): void {
   try {
     fs.writeFileSync(latestTokenPath(), JSON.stringify({ formToken, writtenAt: Date.now() }), "utf-8");

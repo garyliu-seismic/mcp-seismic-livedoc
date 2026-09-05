@@ -51,7 +51,7 @@ export async function apiFetch(
   if (res.status === 401 || res.status === 403) {
     return {
       status: res.status,
-      body: `Authentication failed (HTTP ${res.status} — token expired or missing). The user must sign in via the LiveDoc panel before this action can proceed. Do not call open_form_ui. Do not ask the user for credentials.`,
+      body: `Authentication failed (HTTP ${res.status} — token expired or missing). The user must sign in via the LiveDoc panel before this action can proceed. Do not ask the user for credentials.`,
     };
   }
   const text = await res.text();

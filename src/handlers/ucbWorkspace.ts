@@ -170,12 +170,42 @@ async function commitToWorkspace(generationId: string, pending: PendingCommit) {
   return { committed: true };
 }
 
-export async function getUcbWorkspaceGenerationStatus(args: { generationId: string }) {
-  const result = await apiFetch(`/v3/ucb-workspace-generations/${args.generationId}/status`);
+// Polling budget for a single tool call: previously each call to this tool did exactly one
+// status check, so a caller with a limited number of tool-call rounds (e.g. livedoc-agent's
+// MAX_TOOL_ROUNDS) could exhaust its whole budget polling a slow-to-finish generation and
+// never see status "Ready" (and therefore never see workspaceUrl) at all. Looping internally
+// here collapses "poll every couple seconds until done" into one tool call for the common case,
+// so the caller only needs to re-invoke this tool if the generation is unusually slow.
+const STATUS_POLL_BUDGET_MS = 25_000;
+const STATUS_POLL_INTERVAL_MS = 2_000;
+
+async function fetchStatusOnce(
+  generationId: string
+): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; error: string; detail?: unknown }> {
+  const result = await apiFetch(`/v3/ucb-workspace-generations/${generationId}/status`);
   if (result.status !== 200) {
-    return { error: `Status check failed (HTTP ${result.status})`, detail: result.body };
+    return { ok: false, error: `Status check failed (HTTP ${result.status})`, detail: result.body };
   }
-  const raw = result.body as Record<string, unknown>;
+  return { ok: true, body: result.body as Record<string, unknown> };
+}
+
+export async function getUcbWorkspaceGenerationStatus(args: { generationId: string }) {
+  const deadline = Date.now() + STATUS_POLL_BUDGET_MS;
+  let raw: Record<string, unknown>;
+
+  while (true) {
+    const fetched = await fetchStatusOnce(args.generationId);
+    if (!fetched.ok) return { error: fetched.error, detail: fetched.detail };
+    raw = fetched.body;
+    const status = String(raw.status ?? raw.Status ?? "");
+    // Terminal states resolve immediately regardless of budget; only a non-terminal status
+    // ("Queued"/"Generating"/...) is worth waiting out.
+    if (status === "Ready" || Boolean(raw.isCompleted ?? raw.IsCompleted) || Date.now() >= deadline) {
+      break;
+    }
+    await new Promise(r => setTimeout(r, STATUS_POLL_INTERVAL_MS));
+  }
+
   const status = String(raw.status ?? raw.Status ?? "");
   const isCompleted = Boolean(raw.isCompleted ?? raw.IsCompleted);
 
@@ -187,8 +217,19 @@ export async function getUcbWorkspaceGenerationStatus(args: { generationId: stri
     workspaceCommitted: false,
   };
 
+  if (isCompleted && status !== "Ready") {
+    const errorMessage = String(raw.errorMessage ?? raw.ErrorMessage ?? "").trim();
+    return {
+      ...response,
+      error: `UCB Workspace generation ended with status "${status}"${errorMessage ? `: ${errorMessage}` : ""}`,
+    };
+  }
   if (status !== "Ready") {
-    return response;
+    return {
+      ...response,
+      message: `Generation is still "${status}" after ${STATUS_POLL_BUDGET_MS / 1000}s of polling. ` +
+        "Call get_ucb_workspace_generation_status again to keep waiting — do not report a workspaceUrl yet.",
+    };
   }
 
   const pending = pendingCommits.get(args.generationId);
